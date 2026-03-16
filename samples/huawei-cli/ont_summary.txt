@@ -1,0 +1,4 @@
+F/S/P    ONTID   SN          RunState  ConfigState  Model
+0/1/0    1       HWTC000001  online    normal       EG8145X6
+0/1/0    2       HWTC000002  online    normal       EG8145X6
+0/2/2    7       HWTC000003  online    normal       HG8145V5

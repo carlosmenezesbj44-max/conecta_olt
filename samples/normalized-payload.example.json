@@ -1,0 +1,59 @@
+{
+  "collected_at": "2026-03-08T18:00:00+00:00",
+  "olt_metrics": {
+    "temperature_c": 41.2,
+    "cpu_usage": 38.5,
+    "memory_usage": 55.0
+  },
+  "boards": [
+    {
+      "slot": "0/1",
+      "model": "GPFD",
+      "status": "online",
+      "ports_total": 4
+    }
+  ],
+  "ports": [
+    {
+      "board_slot": "0/1",
+      "name": "PON 1",
+      "capacity_onu": 8,
+      "alert_threshold_pct": 80,
+      "used_onu": 6
+    }
+  ],
+  "onus": [
+    {
+      "serial": "HWTC000001",
+      "model": "EG8145X6",
+      "status": "active",
+      "signal_dbm": -20.4,
+      "traffic_down_mbps": 411.2,
+      "traffic_up_mbps": 87.3,
+      "temperature_c": 48.8,
+      "board_slot": "0/1",
+      "port_name": "PON 1",
+      "pon_position": 1
+    }
+  ],
+  "authorization_requests": [
+    {
+      "serial": "HWTC009999",
+      "detected_model": "EG8145X6",
+      "board_slot": "0/1",
+      "port_name": "PON 2",
+      "requested_signal_dbm": -22.3,
+      "requested_temperature_c": 45.5,
+      "notes": "ONU detectada e aguardando autorizacao."
+    }
+  ],
+  "events": [
+    {
+      "level": "warning",
+      "message": "Porta 0/1 PON 1 acima de 80%.",
+      "details": {
+        "usage_pct": 75.0
+      }
+    }
+  ]
+}

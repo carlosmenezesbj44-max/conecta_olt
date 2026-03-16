@@ -1,0 +1,2 @@
+F/S/P    SN          Model     Note
+0/2/3    HWTC000050  EG8145X6  Nova ONU detectada no autofind

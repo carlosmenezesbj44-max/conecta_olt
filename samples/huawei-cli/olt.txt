@@ -1,0 +1,4 @@
+Device Name: OLT-NOC-01
+System Temperature: 41.6
+CPU Usage: 37.5
+Memory Usage: 53.2

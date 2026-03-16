@@ -1,0 +1,3 @@
+Slot    BoardName   Status   Ports
+0/1     H802GPFD    Normal   4
+0/2     H802GPFD    Normal   4

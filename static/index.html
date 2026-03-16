@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ConectaOLT</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="hero">
+      <div class="hero-main">
+        <div class="hero-brandbar">
+          <img src="/conectaolt-logo.svg" alt="Conecta OLT" class="brand-logo">
+          <span class="hero-suite-badge">NOC Workspace</span>
+        </div>
+        <div class="hero-heading">
+          <div class="hero-copyblock">
+            <p class="hero-kicker">Controle corporativo</p>
+            <h1>Controle operacional multi-vendor</h1>
+            <p class="hero-copy">Um workspace unico para inventario, provisionamento e telemetria da sua base OLT.</p>
+          </div>
+        </div>
+        <div class="hero-capabilities" aria-label="Capacidades principais">
+          <span class="hero-capability">Inventario centralizado</span>
+          <span class="hero-capability">Provisionamento guiado</span>
+          <span class="hero-capability">Telemetria consolidada</span>
+        </div>
+        <div id="heroHighlights" class="hero-highlights" aria-label="Resumo rapido operacional">
+          <article class="hero-highlight">
+            <span class="hero-highlight-label">OLTs</span>
+            <strong>--</strong>
+            <small>base monitorada</small>
+          </article>
+          <article class="hero-highlight">
+            <span class="hero-highlight-label">ONUs ativas</span>
+            <strong>--</strong>
+            <small>em operacao</small>
+          </article>
+          <article class="hero-highlight">
+            <span class="hero-highlight-label">Pendencias</span>
+            <strong>--</strong>
+            <small>fila operacional</small>
+          </article>
+          <article class="hero-highlight">
+            <span class="hero-highlight-label">Alertas</span>
+            <strong>--</strong>
+            <small>capacidade critica</small>
+          </article>
+        </div>
+      </div>
+      <div class="hero-actions">
+        <div class="hero-control-card">
+          <div class="hero-status-top">
+            <p class="hero-status-label">Workspace</p>
+            <span class="hero-mode-pill">Sob demanda</span>
+          </div>
+          <h2 class="hero-control-title">Centro de coleta e status operacional</h2>
+          <p class="hero-control-copy">Dispare uma sincronizacao manual para revisar inventario, metricas e eventos da rede.</p>
+          <button id="syncButton" class="primary-button hero-sync">Sincronizar leitura</button>
+          <div class="hero-status-card">
+            <p id="lastSync" class="hero-status-value">Aguardando coleta</p>
+            <p class="hero-status-hint">Atualiza inventario consolidado, alertas e telemetria em uma unica leitura.</p>
+          </div>
+          <div class="hero-control-meta" aria-label="Detalhes do workspace">
+            <div class="hero-control-metric">
+              <span>Modo</span>
+              <strong>Coleta manual</strong>
+            </div>
+            <div class="hero-control-metric">
+              <span>Escopo</span>
+              <strong>Rede consolidada</strong>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab-button active" data-tab="dashboard">Dashboard</button>
+      <button class="tab-button" data-tab="olts">OLTs</button>
+      <button class="tab-button" data-tab="onus">ONUs</button>
+      <button class="tab-button" data-tab="requests">Solicitacoes</button>
+      <button class="tab-button" data-tab="collection">Coleta</button>
+    </nav>
+
+    <main>
+      <section class="tab-panel active" id="dashboard">
+        <div class="stats-grid" id="summaryCards"></div>
+        <div class="layout-two">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Consumo por OLT</h2>
+            </div>
+            <div id="trafficChart" class="chart-rows"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Distribuicao de sinal</h2>
+            </div>
+            <div id="signalChart" class="chart-rows"></div>
+          </article>
+        </div>
+        <div class="layout-two">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Alertas de portas</h2>
+            </div>
+            <div id="alertsList" class="stack-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Marcas suportadas</h2>
+            </div>
+            <div id="vendorsList" class="vendor-grid"></div>
+          </article>
+        </div>
+        <div class="layout-two">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Historico de infraestrutura</h2>
+            </div>
+            <div id="infraHistory" class="history-grid"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Historico recente de ONUs</h2>
+            </div>
+            <div id="dashboardOnuHistory" class="history-grid"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="olts">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>OLTs e capacidade por placa</h2>
+          </div>
+          <form id="createOltForm" class="stack-list">
+            <input type="hidden" name="editing_olt_id">
+            <div class="inline-two">
+              <input name="name" class="search" placeholder="Nome da OLT">
+              <input name="host" class="search" placeholder="Host ou IP">
+            </div>
+            <div class="request-note olt-template-catalog">
+              <div class="panel-head">
+                <strong>Catalogo de templates</strong>
+                <span id="oltTemplateCatalogCount" class="muted">0 templates</span>
+              </div>
+              <div class="inline-three">
+                <select name="catalog_brand" class="search">
+                  <option value="">Fabricante (catalogo)</option>
+                </select>
+                <select name="catalog_model" class="search">
+                  <option value="">Modelo (catalogo)</option>
+                </select>
+                <select name="catalog_firmware" class="search">
+                  <option value="">Firmware (catalogo)</option>
+                </select>
+              </div>
+              <div id="oltTemplateCatalogSummary" class="muted">
+                Selecione fabricante, modelo e firmware para aplicar o template automaticamente.
+              </div>
+            </div>
+            <div class="inline-two">
+              <input name="brand" class="search" placeholder="Marca">
+              <input name="model" class="search" placeholder="Modelo">
+            </div>
+            <div class="inline-two">
+              <input name="username" class="search" placeholder="Usuario da OLT">
+              <div class="password-field">
+                <input name="password" type="password" class="search" placeholder="Senha da OLT">
+                <button type="button" class="secondary-button toggle-password" data-password-target="createOltForm">Mostrar</button>
+              </div>
+            </div>
+            <div class="inline-two">
+              <select name="transport_type" class="search">
+                <option value="ssh">SSH</option>
+                <option value="telnet">Telnet</option>
+                <option value="snmp">SNMP</option>
+                <option value="api">API</option>
+              </select>
+              <input name="port" type="number" class="search" placeholder="Porta" value="22">
+            </div>
+            <div class="inline-two">
+              <input name="firmware" class="search" placeholder="Firmware">
+              <input name="board_model" class="search" placeholder="Modelo da placa">
+            </div>
+            <div class="inline-two">
+              <input name="board_slots" class="search" placeholder="Slots ex: 0/1,0/2">
+              <input name="ports_per_board" type="number" class="search" placeholder="Portas por placa" value="4">
+            </div>
+            <div class="inline-two">
+              <input name="capacity_onu" type="number" class="search" placeholder="Capacidade por porta" value="128">
+              <input name="status" class="search" placeholder="Status" value="online">
+            </div>
+            <div class="request-actions">
+              <button type="button" id="createOltButton" class="primary-button">Adicionar OLT</button>
+              <button type="button" id="updateOltButton" class="secondary-button">Salvar OLT</button>
+              <button type="button" id="connectOltButton" class="secondary-button">Conectar</button>
+              <button type="button" id="clearOltFormButton" class="secondary-button">Limpar</button>
+            </div>
+            <div id="oltConnectStatus" class="connect-status">
+              <span id="oltConnectBadge" class="status-pill warning">sem teste</span>
+              <span id="oltConnectMessage" class="muted">Sem teste de conexao.</span>
+            </div>
+          </form>
+          <div id="oltTabs" class="subtabs"></div>
+          <div id="oltPanelTabs" class="subtabs">
+            <button type="button" class="subtab-button active" data-olt-panel-tab="infra">Infraestrutura</button>
+            <button type="button" class="subtab-button" data-olt-panel-tab="vlans">VLANs</button>
+          </div>
+          <div id="oltInfraPanel" class="stack-list">
+            <div id="oltDetails" class="stack-list"></div>
+          </div>
+          <div id="oltVlansPanel" class="stack-list hidden">
+            <form id="addOltVlanForm" class="stack-list">
+              <div class="inline-two">
+                <input name="vlan_id" type="number" class="search" placeholder="VLAN (1-4094)">
+                <input name="name" class="search" placeholder="Nome da VLAN (opcional)">
+              </div>
+              <input name="description" class="search" placeholder="Descricao (opcional)">
+              <div class="request-actions">
+                <button type="button" id="addOltVlanButton" class="primary-button">Adicionar VLAN</button>
+              </div>
+            </form>
+            <div id="oltVlanList" class="stack-list"></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="tab-panel" id="onus">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>ONUs liberadas</h2>
+            <input id="onuSearch" class="search" placeholder="Buscar por cliente, serial ou cidade">
+          </div>
+          <div id="onuTable" class="table-wrap"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Detalhes da ONU</h2>
+          </div>
+          <div id="onuDetailsPanel"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Historico da ONU</h2>
+            <select id="onuHistorySelect" class="search"></select>
+          </div>
+          <div id="onuHistoryChart" class="history-grid"></div>
+        </article>
+      </section>
+
+      <section class="tab-panel" id="requests">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Solicitacoes de liberacao</h2>
+            <div class="request-actions">
+              <button type="button" id="syncOltProfilesButton" class="secondary-button">Sincronizar perfis OLT</button>
+              <button type="button" id="runAutofindAllButton" class="secondary-button">Autofind All</button>
+            </div>
+          </div>
+          <div id="requestsStatus" class="muted"></div>
+          <div id="requestsList" class="requests-grid"></div>
+        </article>
+      </section>
+
+      <section class="tab-panel" id="collection">
+        <div class="layout-two">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Conexoes de coleta</h2>
+            </div>
+            <div id="connectionsList" class="requests-grid"></div>
+            <div class="panel-head">
+              <h2>Templates de OLT</h2>
+            </div>
+            <div id="connectionTemplatesList" class="requests-grid"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Eventos de coleta</h2>
+            </div>
+            <div id="eventsList" class="stack-list"></div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="onuModal" class="onu-modal hidden" aria-hidden="true">
+    <div class="onu-modal-backdrop" data-onu-modal-close></div>
+    <section class="onu-modal-card" role="dialog" aria-modal="true" aria-label="Detalhes da ONU">
+      <header class="onu-modal-header">
+        <h3>Detalhes da ONU</h3>
+        <button type="button" class="onu-modal-close" data-onu-modal-close>X</button>
+      </header>
+      <div id="onuModalBody" class="onu-modal-body"></div>
+    </section>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

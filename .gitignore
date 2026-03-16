@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database files
+conectaolt.db
+conectaolt.db.bak-*
+
+# Log files
+*.log
+backend_server.err.log
+backend_server.out.log
+
+# IDE files
+.vscode/
+.idea/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Debug/Sample data generated locally
+debug-huawei-live/
+debug-huawei-live2/
+
+# Environment variables
+.env
