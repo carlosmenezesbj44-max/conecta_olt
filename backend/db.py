@@ -1,13 +1,42 @@
+import base64
+import hashlib
+import hmac
 import json
+import os
 import random
+import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from backend.secrets import decrypt_secret, encrypt_secret
 
 
 DB_PATH = Path(__file__).resolve().parent.parent / "conectaolt.db"
+PASSWORD_HASH_ITERATIONS = 210_000
+SESSION_DURATION_SEC = 12 * 60 * 60
+PERMISSION_CATALOG = [
+    {"key": "dashboard_view", "label": "Dashboard (visualizar)"},
+    {"key": "olts_view", "label": "OLTs (visualizar)"},
+    {"key": "olts_manage", "label": "OLTs (gerenciar)"},
+    {"key": "onus_view", "label": "ONUs (visualizar)"},
+    {"key": "onus_manage", "label": "ONUs (gerenciar)"},
+    {"key": "requests_view", "label": "Solicitacoes (visualizar)"},
+    {"key": "requests_manage", "label": "Solicitacoes (gerenciar)"},
+    {"key": "collection_view", "label": "Coleta (visualizar)"},
+    {"key": "collection_manage", "label": "Coleta (executar/editar)"},
+    {"key": "users_view", "label": "Usuarios (visualizar)"},
+    {"key": "users_manage", "label": "Usuarios (gerenciar)"},
+]
+PERMISSION_KEYS = tuple(item["key"] for item in PERMISSION_CATALOG)
+LEGACY_PERMISSION_MAP = {
+    "dashboard": ("dashboard_view",),
+    "olts": ("olts_view", "olts_manage"),
+    "onus": ("onus_view", "onus_manage"),
+    "requests": ("requests_view", "requests_manage"),
+    "collection": ("collection_view", "collection_manage"),
+    "users": ("users_view", "users_manage"),
+}
 
 TEMPLATE_EXTRA_KEYS = {
     "snmp_version",
@@ -442,10 +471,35 @@ def init_db():
                 updated_at TEXT NOT NULL,
                 UNIQUE(brand, model, firmware)
             );
+
+            CREATE TABLE IF NOT EXISTS app_user (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                permissions_json TEXT NOT NULL DEFAULT '{}',
+                last_login_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS app_session (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                ip_address TEXT,
+                user_agent TEXT
+            );
             """
         )
         ensure_connection_columns(connection)
         ensure_onu_columns(connection)
+        ensure_auth_columns(connection)
         ensure_connection_templates(connection)
         ensure_phase2_records(connection)
 
@@ -599,6 +653,612 @@ def ensure_onu_columns(connection):
     if "onu_mode" not in existing_columns:
         connection.execute("ALTER TABLE onu ADD COLUMN onu_mode TEXT NOT NULL DEFAULT 'bridge'")
     connection.commit()
+
+
+def ensure_auth_columns(connection):
+    existing_user_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(app_user)").fetchall()
+    }
+    user_migrations = [
+        ("display_name", "ALTER TABLE app_user ADD COLUMN display_name TEXT NOT NULL DEFAULT ''"),
+        ("password_hash", "ALTER TABLE app_user ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''"),
+        ("is_active", "ALTER TABLE app_user ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"),
+        ("is_admin", "ALTER TABLE app_user ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"),
+        ("permissions_json", "ALTER TABLE app_user ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '{}'"),
+        ("last_login_at", "ALTER TABLE app_user ADD COLUMN last_login_at TEXT"),
+        ("created_at", "ALTER TABLE app_user ADD COLUMN created_at TEXT"),
+        ("updated_at", "ALTER TABLE app_user ADD COLUMN updated_at TEXT"),
+    ]
+    for column_name, statement in user_migrations:
+        if column_name not in existing_user_columns:
+            connection.execute(statement)
+
+    existing_session_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(app_session)").fetchall()
+    }
+    session_migrations = [
+        ("last_seen_at", "ALTER TABLE app_session ADD COLUMN last_seen_at TEXT"),
+        ("expires_at", "ALTER TABLE app_session ADD COLUMN expires_at TEXT"),
+        ("ip_address", "ALTER TABLE app_session ADD COLUMN ip_address TEXT"),
+        ("user_agent", "ALTER TABLE app_session ADD COLUMN user_agent TEXT"),
+    ]
+    for column_name, statement in session_migrations:
+        if column_name not in existing_session_columns:
+            connection.execute(statement)
+
+    now = utc_now()
+    connection.execute(
+        """
+        UPDATE app_user
+        SET display_name = CASE
+                WHEN TRIM(COALESCE(display_name, '')) = '' THEN username
+                ELSE display_name
+            END,
+            created_at = COALESCE(created_at, ?),
+            updated_at = COALESCE(updated_at, ?),
+            permissions_json = CASE
+                WHEN TRIM(COALESCE(permissions_json, '')) = '' THEN '{}'
+                ELSE permissions_json
+            END
+        """,
+        (now, now),
+    )
+    connection.execute(
+        """
+        UPDATE app_session
+        SET last_seen_at = COALESCE(last_seen_at, created_at, ?),
+            expires_at = COALESCE(expires_at, ?)
+        """,
+        (now, _utc_after_seconds(SESSION_DURATION_SEC)),
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_app_session_user_id ON app_session(user_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_app_session_expires_at ON app_session(expires_at)")
+    connection.commit()
+
+
+def get_permission_catalog():
+    return [dict(item) for item in PERMISSION_CATALOG]
+
+
+def _utc_after_seconds(seconds):
+    return (datetime.now(timezone.utc) + timedelta(seconds=int(seconds))).replace(microsecond=0).isoformat()
+
+
+def _normalize_username(value):
+    return (value or "").strip().lower()
+
+
+def _normalize_permissions(raw_permissions, is_admin=False):
+    normalized = {key: False for key in PERMISSION_KEYS}
+    source = raw_permissions
+    if isinstance(source, str):
+        try:
+            source = json.loads(source)
+        except Exception:
+            source = {}
+    if isinstance(source, list):
+        source = {str(item): True for item in source}
+    if isinstance(source, dict):
+        for legacy_key, mapped_keys in LEGACY_PERMISSION_MAP.items():
+            if bool(source.get(legacy_key)):
+                for mapped in mapped_keys:
+                    normalized[mapped] = True
+        for key in PERMISSION_KEYS:
+            normalized[key] = normalized[key] or bool(source.get(key))
+    if normalized.get("olts_manage"):
+        normalized["olts_view"] = True
+    if normalized.get("onus_manage"):
+        normalized["onus_view"] = True
+    if normalized.get("requests_manage"):
+        normalized["requests_view"] = True
+    if normalized.get("collection_manage"):
+        normalized["collection_view"] = True
+    if normalized.get("users_manage"):
+        normalized["users_view"] = True
+    if is_admin:
+        for key in PERMISSION_KEYS:
+            normalized[key] = True
+    return normalized
+
+
+def _deserialize_permissions(value, is_admin=False):
+    if isinstance(value, dict):
+        return _normalize_permissions(value, is_admin=is_admin)
+    try:
+        payload = json.loads(value or "{}")
+    except Exception:
+        payload = {}
+    return _normalize_permissions(payload, is_admin=is_admin)
+
+
+def _hash_password(raw_password):
+    password = str(raw_password or "")
+    if len(password) < 6:
+        raise ValueError("Senha deve ter pelo menos 6 caracteres.")
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PASSWORD_HASH_ITERATIONS,
+    )
+    return (
+        "pbkdf2_sha256$"
+        f"{PASSWORD_HASH_ITERATIONS}$"
+        f"{base64.b64encode(salt).decode('ascii')}$"
+        f"{base64.b64encode(digest).decode('ascii')}"
+    )
+
+
+def _verify_password(raw_password, password_hash):
+    password = str(raw_password or "")
+    parts = str(password_hash or "").split("$")
+    if len(parts) != 4 or parts[0] != "pbkdf2_sha256":
+        return False
+    try:
+        iterations = int(parts[1])
+        salt = base64.b64decode(parts[2])
+        expected = base64.b64decode(parts[3])
+    except Exception:
+        return False
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return hmac.compare_digest(digest, expected)
+
+
+def _public_user_from_row(row):
+    item = dict(row)
+    is_admin = bool(item.get("is_admin"))
+    return {
+        "id": int(item["id"]),
+        "username": item.get("username") or "",
+        "display_name": item.get("display_name") or item.get("username") or "",
+        "is_active": bool(item.get("is_active")),
+        "is_admin": is_admin,
+        "permissions": _deserialize_permissions(item.get("permissions_json"), is_admin=is_admin),
+        "last_login_at": item.get("last_login_at"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def _has_any_user(connection):
+    return int(connection.execute("SELECT COUNT(*) FROM app_user").fetchone()[0]) > 0
+
+
+def _create_session_for_user(connection, user_id, ip_address=None, user_agent=None):
+    now = utc_now()
+    token = secrets.token_urlsafe(36)
+    connection.execute(
+        """
+        INSERT INTO app_session (token, user_id, created_at, last_seen_at, expires_at, ip_address, user_agent)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            token,
+            int(user_id),
+            now,
+            now,
+            _utc_after_seconds(SESSION_DURATION_SEC),
+            (ip_address or "").strip() or None,
+            (user_agent or "").strip() or None,
+        ),
+    )
+    return token
+
+
+def _delete_expired_sessions(connection):
+    now = utc_now()
+    connection.execute("DELETE FROM app_session WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,))
+
+
+def has_permission(session_payload, permission_key):
+    if not isinstance(session_payload, dict):
+        return False
+    user = session_payload.get("user") or {}
+    if user.get("is_admin"):
+        return True
+    permissions = session_payload.get("permissions") or {}
+    if permission_key in LEGACY_PERMISSION_MAP:
+        return any(bool(permissions.get(mapped)) for mapped in LEGACY_PERMISSION_MAP[permission_key])
+    return bool(permissions.get(permission_key))
+
+
+def fetch_auth_session(token=None):
+    with connect() as connection:
+        _delete_expired_sessions(connection)
+        bootstrap_required = not _has_any_user(connection)
+        if not token:
+            connection.commit()
+            return {
+                "authenticated": False,
+                "bootstrap_required": bootstrap_required,
+                "permission_catalog": get_permission_catalog(),
+                "user": None,
+                "permissions": _normalize_permissions({}),
+            }
+
+        row = connection.execute(
+            """
+            SELECT
+                session.id AS session_id,
+                session.user_id,
+                user.id,
+                user.username,
+                user.display_name,
+                user.is_active,
+                user.is_admin,
+                user.permissions_json,
+                user.last_login_at,
+                user.created_at,
+                user.updated_at
+            FROM app_session session
+            JOIN app_user user ON user.id = session.user_id
+            WHERE session.token = ?
+              AND user.is_active = 1
+              AND session.expires_at > ?
+            LIMIT 1
+            """,
+            (token, utc_now()),
+        ).fetchone()
+        if not row:
+            connection.commit()
+            return {
+                "authenticated": False,
+                "bootstrap_required": bootstrap_required,
+                "permission_catalog": get_permission_catalog(),
+                "user": None,
+                "permissions": _normalize_permissions({}),
+            }
+
+        now = utc_now()
+        connection.execute(
+            """
+            UPDATE app_session
+            SET last_seen_at = ?
+            WHERE id = ?
+            """,
+            (now, int(row["session_id"])),
+        )
+        connection.commit()
+        user = _public_user_from_row(row)
+        return {
+            "authenticated": True,
+            "bootstrap_required": False,
+            "permission_catalog": get_permission_catalog(),
+            "user": user,
+            "permissions": user["permissions"],
+        }
+
+
+def authenticate_user(username, password, ip_address=None, user_agent=None):
+    identity = _normalize_username(username)
+    if not identity:
+        raise ValueError("Informe usuario e senha.")
+    with connect() as connection:
+        _delete_expired_sessions(connection)
+        row = connection.execute(
+            """
+            SELECT id, username, display_name, password_hash, is_active, is_admin,
+                   permissions_json, last_login_at, created_at, updated_at
+            FROM app_user
+            WHERE username = ?
+            LIMIT 1
+            """,
+            (identity,),
+        ).fetchone()
+        if not row or not bool(row["is_active"]):
+            raise ValueError("Usuario ou senha invalidos.")
+        if not _verify_password(password, row["password_hash"]):
+            raise ValueError("Usuario ou senha invalidos.")
+        token = _create_session_for_user(
+            connection,
+            int(row["id"]),
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        now = utc_now()
+        connection.execute(
+            """
+            UPDATE app_user
+            SET last_login_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, int(row["id"])),
+        )
+        refreshed = connection.execute(
+            """
+            SELECT id, username, display_name, is_active, is_admin, permissions_json,
+                   last_login_at, created_at, updated_at
+            FROM app_user
+            WHERE id = ?
+            """,
+            (int(row["id"]),),
+        ).fetchone()
+        connection.commit()
+        user = _public_user_from_row(refreshed)
+        return {
+            "token": token,
+            "user": user,
+            "permissions": user["permissions"],
+            "authenticated": True,
+            "bootstrap_required": False,
+            "permission_catalog": get_permission_catalog(),
+        }
+
+
+def logout_session(token):
+    if not token:
+        return {"status": "ok"}
+    with connect() as connection:
+        connection.execute("DELETE FROM app_session WHERE token = ?", (token,))
+        connection.commit()
+    return {"status": "ok"}
+
+
+def bootstrap_admin_user(payload, ip_address=None, user_agent=None):
+    payload = payload or {}
+    username = _normalize_username(payload.get("username"))
+    display_name = (payload.get("display_name") or "").strip() or username
+    password = str(payload.get("password") or "")
+    if not username:
+        raise ValueError("Informe o usuario administrador.")
+    if len(password) < 6:
+        raise ValueError("Senha deve ter pelo menos 6 caracteres.")
+    now = utc_now()
+    with connect() as connection:
+        if _has_any_user(connection):
+            raise ValueError("Bootstrap ja realizado. Faça login.")
+        cursor = connection.execute(
+            """
+            INSERT INTO app_user (
+                username, display_name, password_hash, is_active, is_admin,
+                permissions_json, last_login_at, created_at, updated_at
+            ) VALUES (?, ?, ?, 1, 1, ?, NULL, ?, ?)
+            """,
+            (
+                username,
+                display_name,
+                _hash_password(password),
+                json.dumps(_normalize_permissions({}, is_admin=True)),
+                now,
+                now,
+            ),
+        )
+        token = _create_session_for_user(
+            connection,
+            cursor.lastrowid,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        connection.execute(
+            "UPDATE app_user SET last_login_at = ? WHERE id = ?",
+            (now, int(cursor.lastrowid)),
+        )
+        row = connection.execute(
+            """
+            SELECT id, username, display_name, is_active, is_admin, permissions_json,
+                   last_login_at, created_at, updated_at
+            FROM app_user
+            WHERE id = ?
+            """,
+            (int(cursor.lastrowid),),
+        ).fetchone()
+        connection.commit()
+        user = _public_user_from_row(row)
+        return {
+            "token": token,
+            "authenticated": True,
+            "bootstrap_required": False,
+            "permission_catalog": get_permission_catalog(),
+            "user": user,
+            "permissions": user["permissions"],
+        }
+
+
+def fetch_users():
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, username, display_name, is_active, is_admin, permissions_json,
+                   last_login_at, created_at, updated_at
+            FROM app_user
+            ORDER BY username
+            """
+        ).fetchall()
+        return [_public_user_from_row(row) for row in rows]
+
+
+def create_user(payload, actor_user_id=None):
+    payload = payload or {}
+    username = _normalize_username(payload.get("username"))
+    display_name = (payload.get("display_name") or "").strip() or username
+    password = str(payload.get("password") or "")
+    is_active = bool(payload.get("is_active", True))
+    is_admin = bool(payload.get("is_admin", False))
+    permissions = _normalize_permissions(payload.get("permissions") or {}, is_admin=is_admin)
+    if not username:
+        raise ValueError("Usuario e obrigatorio.")
+    if len(password) < 6:
+        raise ValueError("Senha deve ter pelo menos 6 caracteres.")
+    now = utc_now()
+    with connect() as connection:
+        duplicate = connection.execute(
+            "SELECT id FROM app_user WHERE username = ?",
+            (username,),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("Ja existe um usuario com esse login.")
+        cursor = connection.execute(
+            """
+            INSERT INTO app_user (
+                username, display_name, password_hash, is_active, is_admin,
+                permissions_json, last_login_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (
+                username,
+                display_name,
+                _hash_password(password),
+                1 if is_active else 0,
+                1 if is_admin else 0,
+                json.dumps(permissions),
+                now,
+                now,
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT id, username, display_name, is_active, is_admin, permissions_json,
+                   last_login_at, created_at, updated_at
+            FROM app_user
+            WHERE id = ?
+            """,
+            (int(cursor.lastrowid),),
+        ).fetchone()
+        connection.commit()
+        return _public_user_from_row(row)
+
+
+def update_user(user_id, payload, actor_user_id=None):
+    payload = payload or {}
+    user_id = int(user_id)
+    now = utc_now()
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT id, username, display_name, is_active, is_admin, permissions_json,
+                   last_login_at, created_at, updated_at
+            FROM app_user
+            WHERE id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("Usuario nao encontrado.")
+
+        current = _public_user_from_row(row)
+        username = _normalize_username(payload.get("username") if "username" in payload else current["username"])
+        display_name = (
+            (payload.get("display_name") if "display_name" in payload else current["display_name"]) or ""
+        ).strip() or username
+        is_active = bool(payload.get("is_active")) if "is_active" in payload else current["is_active"]
+        is_admin = bool(payload.get("is_admin")) if "is_admin" in payload else current["is_admin"]
+        permissions_source = payload.get("permissions") if "permissions" in payload else current["permissions"]
+        permissions = _normalize_permissions(permissions_source, is_admin=is_admin)
+        password = payload.get("password")
+
+        if not username:
+            raise ValueError("Usuario e obrigatorio.")
+        duplicate = connection.execute(
+            "SELECT id FROM app_user WHERE username = ? AND id <> ?",
+            (username, user_id),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("Ja existe um usuario com esse login.")
+
+        if not is_admin and current["is_admin"]:
+            remaining_admins = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM app_user
+                WHERE is_admin = 1
+                  AND is_active = 1
+                  AND id <> ?
+                """,
+                (user_id,),
+            ).fetchone()[0]
+            if int(remaining_admins) == 0:
+                raise ValueError("Nao e permitido remover o ultimo administrador ativo.")
+        if not is_active and current["is_admin"]:
+            remaining_admins = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM app_user
+                WHERE is_admin = 1
+                  AND is_active = 1
+                  AND id <> ?
+                """,
+                (user_id,),
+            ).fetchone()[0]
+            if int(remaining_admins) == 0:
+                raise ValueError("Nao e permitido desativar o ultimo administrador ativo.")
+
+        password_hash = row["password_hash"]
+        if password is not None and str(password) != "":
+            password_hash = _hash_password(password)
+
+        connection.execute(
+            """
+            UPDATE app_user
+            SET username = ?, display_name = ?, password_hash = ?, is_active = ?, is_admin = ?,
+                permissions_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                username,
+                display_name,
+                password_hash,
+                1 if is_active else 0,
+                1 if is_admin else 0,
+                json.dumps(permissions),
+                now,
+                user_id,
+            ),
+        )
+        if not is_active:
+            connection.execute("DELETE FROM app_session WHERE user_id = ?", (user_id,))
+        updated = connection.execute(
+            """
+            SELECT id, username, display_name, is_active, is_admin, permissions_json,
+                   last_login_at, created_at, updated_at
+            FROM app_user
+            WHERE id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        connection.commit()
+        return _public_user_from_row(updated)
+
+
+def delete_user(user_id, actor_user_id=None):
+    user_id = int(user_id)
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT id, username, is_admin, is_active
+            FROM app_user
+            WHERE id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("Usuario nao encontrado.")
+        if actor_user_id is not None and int(actor_user_id) == user_id:
+            raise ValueError("Nao e permitido excluir o proprio usuario logado.")
+        if bool(row["is_admin"]) and bool(row["is_active"]):
+            remaining_admins = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM app_user
+                WHERE is_admin = 1
+                  AND is_active = 1
+                  AND id <> ?
+                """,
+                (user_id,),
+            ).fetchone()[0]
+            if int(remaining_admins) == 0:
+                raise ValueError("Nao e permitido excluir o ultimo administrador ativo.")
+
+        connection.execute("DELETE FROM app_user WHERE id = ?", (user_id,))
+        connection.commit()
+        return {"status": "deleted", "id": user_id, "username": row["username"]}
 
 
 def _normalize_identity(value):

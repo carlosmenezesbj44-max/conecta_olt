@@ -9,6 +9,16 @@ const state = {
   connections: [],
   connectionTemplates: [],
   events: [],
+  users: [],
+  permissionCatalog: [],
+  auth: {
+    authenticated: false,
+    bootstrap_required: false,
+    user: null,
+    permissions: {},
+    permission_catalog: [],
+  },
+  activeTab: "dashboard",
   requestsOperationStatus: null,
   requestPreviewsById: {},
   requestPreviewLoadingById: {},
@@ -66,20 +76,119 @@ const ONU_FULL_REFRESH_FIELDS = [
   "traffic_down",
   "traffic_up",
 ];
+const EMPTY_DASHBOARD = {
+  summary: {
+    olts: 0,
+    active_onus: 0,
+    pending_requests: 0,
+    ports_near_capacity: 0,
+  },
+  alerts: [],
+  traffic_chart: [],
+  signal_chart: [],
+};
+const EMPTY_HISTORY = {
+  olt_history: [],
+  onu_history: [],
+};
+const TAB_PERMISSION_MAP = {
+  dashboard: "dashboard_view",
+  olts: "olts_view",
+  onus: "onus_view",
+  requests: "requests_view",
+  collection: "collection_view",
+  users: "users_view",
+};
+const USER_PERMISSION_PRESETS = [
+  {
+    key: "noc_read",
+    label: "NOC Leitura",
+    description: "Somente visualizacao operacional.",
+    is_admin: false,
+    permissions: ["dashboard_view", "olts_view", "onus_view", "requests_view", "collection_view"],
+  },
+  {
+    key: "noc_ops",
+    label: "NOC Operacao",
+    description: "Visualizacao + operacao de ONUs, solicitacoes e coleta.",
+    is_admin: false,
+    permissions: [
+      "dashboard_view",
+      "olts_view",
+      "onus_view",
+      "onus_manage",
+      "requests_view",
+      "requests_manage",
+      "collection_view",
+      "collection_manage",
+    ],
+  },
+  {
+    key: "admin",
+    label: "Administrador",
+    description: "Acesso total.",
+    is_admin: true,
+    permissions: [],
+  },
+];
 
 async function fetchJson(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
-  const payload = await response.json();
+  const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.error || "Falha na requisicao.");
+    const error = new Error(payload.error || "Falha na requisicao.");
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   return payload;
 }
 
+function hasPermission(permissionKey) {
+  const auth = state.auth || {};
+  if (!permissionKey) {
+    return Boolean(auth.authenticated);
+  }
+  if (auth?.user?.is_admin) {
+    return true;
+  }
+  return Boolean(auth?.permissions?.[permissionKey]);
+}
+
+function requirePermission(permissionKey, message) {
+  if (hasPermission(permissionKey)) {
+    return;
+  }
+  throw new Error(message || "Sem permissao para esta acao.");
+}
+
+function defaultDashboardPayload() {
+  return {
+    summary: { ...EMPTY_DASHBOARD.summary },
+    alerts: [],
+    traffic_chart: [],
+    signal_chart: [],
+  };
+}
+
+function defaultHistoryPayload() {
+  return {
+    olt_history: [],
+    onu_history: [],
+  };
+}
+
 async function loadData() {
+  const canDashboard = hasPermission("dashboard_view");
+  const canOlts = hasPermission("olts_view");
+  const canOnus = hasPermission("onus_view");
+  const canRequests = hasPermission("requests_view");
+  const canCollection = hasPermission("collection_view");
+  const canUsers = hasPermission("users_view");
+
   const [
     dashboard,
     olts,
@@ -91,30 +200,39 @@ async function loadData() {
     connectionTemplates,
     history,
     events,
+    usersPayload,
   ] = await Promise.all([
-    fetchJson("/api/dashboard"),
-    fetchJson("/api/olts"),
-    fetchJson("/api/onus"),
-    fetchJson("/api/profiles"),
-    fetchJson("/api/authorization-requests"),
-    fetchJson("/api/vendors"),
-    fetchJson("/api/connections"),
-    fetchJson("/api/connection-templates"),
-    fetchJson("/api/history/dashboard"),
-    fetchJson("/api/events"),
+    canDashboard ? fetchJson("/api/dashboard") : Promise.resolve(defaultDashboardPayload()),
+    canOlts ? fetchJson("/api/olts") : Promise.resolve([]),
+    canOnus ? fetchJson("/api/onus") : Promise.resolve([]),
+    canRequests ? fetchJson("/api/profiles") : Promise.resolve([]),
+    canRequests ? fetchJson("/api/authorization-requests") : Promise.resolve([]),
+    canDashboard ? fetchJson("/api/vendors") : Promise.resolve([]),
+    canCollection ? fetchJson("/api/connections") : Promise.resolve([]),
+    canCollection ? fetchJson("/api/connection-templates") : Promise.resolve([]),
+    canDashboard ? fetchJson("/api/history/dashboard") : Promise.resolve(defaultHistoryPayload()),
+    canCollection ? fetchJson("/api/events") : Promise.resolve([]),
+    canUsers ? fetchJson("/api/users") : Promise.resolve({ items: [], permission_catalog: state.permissionCatalog }),
   ]);
 
-  state.dashboard = dashboard;
-  state.olts = olts;
-  state.onus = onus;
-  state.profiles = profiles;
-  state.requests = requests;
-  state.vendors = vendors;
-  state.connections = connections;
-  state.connectionTemplates = connectionTemplates;
-  state.history = history;
-  state.events = events;
-  const requestIds = new Set(requests.map((item) => Number(item.id)));
+  state.dashboard = dashboard || defaultDashboardPayload();
+  state.olts = Array.isArray(olts) ? olts : [];
+  state.onus = Array.isArray(onus) ? onus : [];
+  state.profiles = Array.isArray(profiles) ? profiles : [];
+  state.requests = Array.isArray(requests) ? requests : [];
+  state.vendors = Array.isArray(vendors) ? vendors : [];
+  state.connections = Array.isArray(connections) ? connections : [];
+  state.connectionTemplates = Array.isArray(connectionTemplates) ? connectionTemplates : [];
+  state.history = history || defaultHistoryPayload();
+  state.events = Array.isArray(events) ? events : [];
+  state.users = Array.isArray(usersPayload?.items) ? usersPayload.items : [];
+  if (Array.isArray(usersPayload?.permission_catalog) && usersPayload.permission_catalog.length) {
+    state.permissionCatalog = usersPayload.permission_catalog;
+  } else if (Array.isArray(state.auth?.permission_catalog) && state.auth.permission_catalog.length) {
+    state.permissionCatalog = state.auth.permission_catalog;
+  }
+
+  const requestIds = new Set(state.requests.map((item) => Number(item.id)));
   Object.keys(state.requestPreviewsById).forEach((key) => {
     if (!requestIds.has(Number(key))) {
       delete state.requestPreviewsById[key];
@@ -135,7 +253,7 @@ async function loadData() {
       delete state.requestDraftsById[key];
     }
   });
-  const onuIds = new Set(onus.map((item) => Number(item.id)));
+  const onuIds = new Set(state.onus.map((item) => Number(item.id)));
   Object.keys(state.onuPhysicalStatusByOnuId).forEach((key) => {
     if (!onuIds.has(Number(key))) {
       delete state.onuPhysicalStatusByOnuId[key];
@@ -147,26 +265,346 @@ async function loadData() {
     }
   });
 
-  if ((!state.activeOltId || !olts.some((olt) => olt.id === state.activeOltId)) && olts.length) {
-    state.activeOltId = olts[0].id;
-  } else if (!olts.length) {
+  if ((!state.activeOltId || !state.olts.some((olt) => olt.id === state.activeOltId)) && state.olts.length) {
+    state.activeOltId = state.olts[0].id;
+  } else if (!state.olts.length) {
     state.activeOltId = null;
   }
-  if ((!state.selectedOnuId || !onus.some((onu) => onu.id === state.selectedOnuId)) && onus.length) {
-    state.selectedOnuId = onus[0].id;
-  } else if (!onus.length) {
+  if ((!state.selectedOnuId || !state.onus.some((onu) => onu.id === state.selectedOnuId)) && state.onus.length) {
+    state.selectedOnuId = state.onus[0].id;
+  } else if (!state.onus.length) {
     state.selectedOnuId = null;
   }
-  try {
-    await refreshOltVlans();
-  } catch (_) {
-    if (state.activeOltId) {
-      state.oltVlansByOltId[state.activeOltId] = [];
+
+  if (canOlts) {
+    try {
+      await refreshOltVlans();
+    } catch (_) {
+      if (state.activeOltId) {
+        state.oltVlansByOltId[state.activeOltId] = [];
+      }
     }
+  } else {
+    state.oltVlansByOltId = {};
+    state.activeOltId = null;
   }
-  await refreshOnuHistory();
+
+  if (canOnus) {
+    await refreshOnuHistory();
+  } else {
+    state.selectedOnuId = null;
+    state.onuHistory = null;
+    stopOnuLiveMonitor();
+  }
+
+  applyPermissionVisibility();
   renderAll();
-  syncOnuSignalAutoRefresh();
+  if (canOnus && hasPermission("onus_manage")) {
+    syncOnuSignalAutoRefresh();
+  } else {
+    syncOnuSignalAutoRefresh(true);
+  }
+}
+
+function clearAppDataForLogout() {
+  state.dashboard = defaultDashboardPayload();
+  state.history = defaultHistoryPayload();
+  state.olts = [];
+  state.onus = [];
+  state.profiles = [];
+  state.requests = [];
+  state.vendors = [];
+  state.connections = [];
+  state.connectionTemplates = [];
+  state.events = [];
+  state.users = [];
+  state.activeOltId = null;
+  state.selectedOnuId = null;
+  state.onuHistory = null;
+  state.oltVlansByOltId = {};
+  state.requestPreviewsById = {};
+  state.requestPreviewLoadingById = {};
+  state.requestAuthorizeProgressById = {};
+  state.requestDraftsById = {};
+  state.onuLiveStatus = {};
+  state.onuActionResult = {};
+  state.onuDeleteProgress = {};
+  state.onuLiveSeriesByOnuId = {};
+  state.onuPhysicalStatusByOnuId = {};
+  stopOnuLiveMonitor();
+}
+
+function getVisibleTabIds() {
+  return Array.from(document.querySelectorAll(".tab-button"))
+    .filter((button) => !button.classList.contains("hidden"))
+    .map((button) => button.dataset.tab)
+    .filter(Boolean);
+}
+
+function activateTab(tabId) {
+  const visibleTabs = getVisibleTabIds();
+  const selectedTabId = visibleTabs.includes(tabId) ? tabId : visibleTabs[0] || null;
+  if (!selectedTabId) {
+    return;
+  }
+  state.activeTab = selectedTabId;
+  document.querySelectorAll(".tab-button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.tab === selectedTabId);
+  });
+  document.querySelectorAll(".tab-panel").forEach((panel) => {
+    panel.classList.toggle("active", panel.id === selectedTabId);
+  });
+}
+
+function applyPermissionVisibility() {
+  Object.entries(TAB_PERMISSION_MAP).forEach(([tabId, permissionKey]) => {
+    const tabButton = document.querySelector(`.tab-button[data-tab="${tabId}"]`);
+    const panel = document.getElementById(tabId);
+    const allowed = hasPermission(permissionKey);
+    if (tabButton) {
+      tabButton.classList.toggle("hidden", !allowed);
+    }
+    if (panel && !allowed) {
+      panel.classList.remove("active");
+    }
+  });
+  const candidate = hasPermission(TAB_PERMISSION_MAP[state.activeTab]) ? state.activeTab : null;
+  activateTab(candidate || getVisibleTabIds()[0] || "dashboard");
+
+  const syncButton = document.getElementById("syncButton");
+  if (syncButton) {
+    const allowed = hasPermission("collection_manage");
+    syncButton.disabled = !allowed;
+    syncButton.title = allowed ? "" : "Sem permissao de coleta";
+  }
+
+  const canManageOlts = hasPermission("olts_manage");
+  const oltForm = document.getElementById("createOltForm");
+  if (oltForm) {
+    oltForm.querySelectorAll("input, select").forEach((node) => {
+      if (node.name === "editing_olt_id") {
+        return;
+      }
+      node.disabled = !canManageOlts;
+    });
+  }
+  ["createOltButton", "updateOltButton", "connectOltButton", "clearOltFormButton", "addOltVlanButton"].forEach((id) => {
+    const button = document.getElementById(id);
+    if (button) {
+      button.disabled = !canManageOlts;
+    }
+  });
+  const connectButton = document.getElementById("connectOltButton");
+  if (connectButton) {
+    connectButton.disabled = !canManageOlts || !hasPermission("collection_manage");
+  }
+
+  const canManageRequests = hasPermission("requests_manage");
+  ["runAutofindAllButton", "syncOltProfilesButton"].forEach((id) => {
+    const button = document.getElementById(id);
+    if (button) {
+      button.disabled = !canManageRequests;
+    }
+  });
+}
+
+function setAuthStatus(message = "", isError = false) {
+  const statusNode = document.getElementById("authStatus");
+  if (!statusNode) {
+    return;
+  }
+  statusNode.textContent = message || "";
+  statusNode.style.color = isError ? "#9f3f35" : "";
+}
+
+function showAuthScreen() {
+  const authScreen = document.getElementById("authScreen");
+  const appShell = document.getElementById("appShell");
+  const loginForm = document.getElementById("loginForm");
+  const bootstrapForm = document.getElementById("bootstrapForm");
+  const bootstrapRequired = Boolean(state.auth?.bootstrap_required);
+
+  authScreen?.classList.remove("hidden");
+  appShell?.classList.add("hidden");
+  if (loginForm) {
+    loginForm.classList.toggle("hidden", bootstrapRequired);
+  }
+  if (bootstrapForm) {
+    bootstrapForm.classList.toggle("hidden", !bootstrapRequired);
+  }
+}
+
+function showAppShell() {
+  const authScreen = document.getElementById("authScreen");
+  const appShell = document.getElementById("appShell");
+  authScreen?.classList.add("hidden");
+  appShell?.classList.remove("hidden");
+}
+
+function renderSessionBadge() {
+  const badge = document.getElementById("sessionUserBadge");
+  const logoutButton = document.getElementById("logoutButton");
+  const user = state.auth?.user;
+  if (!badge || !logoutButton || !user) {
+    if (badge) {
+      badge.classList.add("hidden");
+      badge.textContent = "";
+    }
+    if (logoutButton) {
+      logoutButton.classList.add("hidden");
+    }
+    return;
+  }
+  badge.textContent = `${user.display_name || user.username} (${user.is_admin ? "admin" : "operador"})`;
+  badge.classList.remove("hidden");
+  logoutButton.classList.remove("hidden");
+}
+
+function renderUserPermissionInputs(form, permissionCatalog, selectedPermissions = {}) {
+  if (!form) {
+    return;
+  }
+  const container = form.querySelector("[data-permission-container]") || form.querySelector(".user-permission-grid");
+  if (!container) {
+    return;
+  }
+  const catalogRows = Array.isArray(permissionCatalog) ? permissionCatalog : [];
+  container.innerHTML = catalogRows
+    .map((item) => {
+      const key = String(item?.key || "").trim();
+      if (!key) {
+        return "";
+      }
+      const label = String(item?.label || key);
+      return `
+        <label class="checkbox-row">
+          <input type="checkbox" name="perm_${escapeHtml(key)}" data-permission-key="${escapeHtml(key)}" ${
+            selectedPermissions?.[key] ? "checked" : ""
+          }>
+          ${escapeHtml(label)}
+        </label>
+      `;
+    })
+    .join("");
+}
+
+function collectPermissionsFromForm(form) {
+  const permissions = {};
+  if (!form) {
+    return permissions;
+  }
+  form.querySelectorAll("[data-permission-key]").forEach((input) => {
+    const key = input.dataset.permissionKey;
+    if (!key) {
+      return;
+    }
+    permissions[key] = Boolean(input.checked);
+  });
+  return permissions;
+}
+
+function toggleUserPermissionInputs(form, disabled) {
+  if (!form) {
+    return;
+  }
+  form.querySelectorAll("[data-permission-key]").forEach((input) => {
+    input.disabled = Boolean(disabled);
+  });
+}
+
+async function refreshAuthSession() {
+  const session = await fetchJson("/api/auth/session");
+  state.auth = session || {
+    authenticated: false,
+    bootstrap_required: false,
+    user: null,
+    permissions: {},
+    permission_catalog: [],
+  };
+  if (Array.isArray(state.auth?.permission_catalog) && state.auth.permission_catalog.length) {
+    state.permissionCatalog = state.auth.permission_catalog;
+  }
+  return state.auth;
+}
+
+async function performLogin() {
+  const form = document.getElementById("loginForm");
+  if (!form) {
+    return;
+  }
+  const payload = {
+    username: form.username.value.trim(),
+    password: form.password.value,
+  };
+  const session = await fetchJson("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  state.auth = session;
+  if (Array.isArray(session?.permission_catalog) && session.permission_catalog.length) {
+    state.permissionCatalog = session.permission_catalog;
+  }
+  form.reset();
+  setAuthStatus("");
+  showAppShell();
+  renderSessionBadge();
+  applyPermissionVisibility();
+  await loadData();
+}
+
+async function performBootstrap() {
+  const form = document.getElementById("bootstrapForm");
+  if (!form) {
+    return;
+  }
+  const payload = {
+    username: form.username.value.trim(),
+    display_name: form.display_name.value.trim(),
+    password: form.password.value,
+  };
+  const session = await fetchJson("/api/auth/bootstrap", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  state.auth = session;
+  if (Array.isArray(session?.permission_catalog) && session.permission_catalog.length) {
+    state.permissionCatalog = session.permission_catalog;
+  }
+  form.reset();
+  setAuthStatus("");
+  showAppShell();
+  renderSessionBadge();
+  applyPermissionVisibility();
+  await loadData();
+}
+
+async function performLogout() {
+  await fetchJson("/api/auth/logout", { method: "POST", body: "{}" });
+  clearAppDataForLogout();
+  await refreshAuthSession();
+  renderSessionBadge();
+  applyPermissionVisibility();
+  showAuthScreen();
+}
+
+async function ensureAuthenticatedAndLoad() {
+  await refreshAuthSession();
+  if (!state.auth?.authenticated) {
+    clearAppDataForLogout();
+    renderSessionBadge();
+    showAuthScreen();
+    setAuthStatus(
+      state.auth?.bootstrap_required
+        ? "Nenhum usuario cadastrado. Crie o administrador inicial."
+        : "Entre com seu usuario para continuar."
+    );
+    return;
+  }
+  setAuthStatus("");
+  showAppShell();
+  renderSessionBadge();
+  applyPermissionVisibility();
+  await loadData();
 }
 
 async function refreshOltVlans() {
@@ -552,6 +990,7 @@ function renderAll() {
   renderConnections();
   renderConnectionTemplates();
   renderEvents();
+  renderUsers();
 }
 
 function renderSummary() {
@@ -766,6 +1205,7 @@ function renderOltPanels() {
 }
 
 function renderOltDetails() {
+  const canManageOlts = hasPermission("olts_manage");
   const olt = state.olts.find((item) => item.id === state.activeOltId);
   const container = document.getElementById("oltDetails");
   if (!olt) {
@@ -782,7 +1222,7 @@ function renderOltDetails() {
       <span class="muted">${olt.temperature_c} C</span>
       <span class="muted">CPU ${olt.cpu_usage}%</span>
       <span class="muted">MEM ${olt.memory_usage}%</span>
-      <button type="button" class="secondary-button" data-delete-olt-id="${olt.id}">Excluir OLT</button>
+      <button type="button" class="secondary-button" data-delete-olt-id="${olt.id}" ${canManageOlts ? "" : "disabled"}>Excluir OLT</button>
     </div>
     <div class="olt-summary">
       <div class="summary-chip"><strong>${olt.summary.boards}</strong><div class="muted">Placas</div></div>
@@ -799,11 +1239,15 @@ function renderOltDetails() {
 }
 
 function renderOltVlans() {
+  const canManageOlts = hasPermission("olts_manage");
   const container = document.getElementById("oltVlanList");
   const form = document.getElementById("addOltVlanForm");
   if (!container || !form) {
     return;
   }
+  form.querySelectorAll("input, button, select").forEach((node) => {
+    node.disabled = !canManageOlts;
+  });
   const olt = state.olts.find((item) => item.id === state.activeOltId);
   if (!olt) {
     container.innerHTML = '<div class="muted">Selecione uma OLT para gerenciar VLANs.</div>';
@@ -850,13 +1294,13 @@ function renderOltVlans() {
             <strong>VLAN ${selected ? selected.vlan_id : "-"}</strong>
             <div class="request-actions">
               <span class="status-pill ${selected?.source === "manual" ? "ok" : "warning"}">${selected?.source || "-"}</span>
-              <button type="button" class="secondary-button" data-olt-vlan-action="save" ${selected ? "" : "disabled"}>Salvar</button>
-              <button type="button" class="secondary-button" data-olt-vlan-action="delete" ${selected ? "" : "disabled"}>Excluir</button>
+              <button type="button" class="secondary-button" data-olt-vlan-action="save" ${selected && canManageOlts ? "" : "disabled"}>Salvar</button>
+              <button type="button" class="secondary-button" data-olt-vlan-action="delete" ${selected && canManageOlts ? "" : "disabled"}>Excluir</button>
             </div>
           </div>
           <div class="inline-two">
-            <input id="selectedVlanName" class="search" value="${selected?.name || ""}" placeholder="Nome da VLAN" ${selected ? "" : "disabled"}>
-            <input id="selectedVlanDescription" class="search" value="${selected?.description || ""}" placeholder="Descricao da VLAN" ${selected ? "" : "disabled"}>
+            <input id="selectedVlanName" class="search" value="${selected?.name || ""}" placeholder="Nome da VLAN" ${selected && canManageOlts ? "" : "disabled"}>
+            <input id="selectedVlanDescription" class="search" value="${selected?.description || ""}" placeholder="Descricao da VLAN" ${selected && canManageOlts ? "" : "disabled"}>
           </div>
           <div class="muted">Atualizada em ${selected?.updated_at ? formatDateTime(selected.updated_at) : "-"}</div>
         </article>
@@ -1892,6 +2336,7 @@ function renderOnuDetailsPanel() {
   if (!container) {
     return;
   }
+  const canManageOnus = hasPermission("onus_manage");
   const onu = findSelectedOnu();
   if (!onu) {
     container.innerHTML = '<div class="muted">Selecione uma ONU para ver os detalhes.</div>';
@@ -2029,12 +2474,12 @@ function renderOnuDetailsPanel() {
       </table>
       <div class="onu-service-line">VoIP: ${hasVoip(onu) ? "Enabled" : "Disabled"} | IPTV: Inactive | CATV: ${hasTv(onu) ? "Enable" : "Disable"}</div>
       <div class="onu-actions">
-        <button type="button" class="primary-button" data-onu-quick-action="refresh-all">Atualizar ONU</button>
-        <button type="button" class="secondary-button" data-onu-quick-action="status">Get status</button>
-        <button type="button" class="secondary-button" data-onu-quick-action="running">Show running-config</button>
-        <button type="button" class="secondary-button" data-onu-quick-action="swinfo">SW info</button>
-        <button type="button" class="primary-button" data-onu-quick-action="live">${liveActive ? "Parar LIVE" : "LIVE PON"}</button>
-        <button type="button" class="secondary-button" data-onu-delete-id="${onu.id}" ${deleteActive ? "disabled" : ""}>${deleteActive ? "Excluindo..." : "Excluir ONU"}</button>
+        <button type="button" class="primary-button" data-onu-quick-action="refresh-all" ${canManageOnus ? "" : "disabled"}>Atualizar ONU</button>
+        <button type="button" class="secondary-button" data-onu-quick-action="status" ${canManageOnus ? "" : "disabled"}>Get status</button>
+        <button type="button" class="secondary-button" data-onu-quick-action="running" ${canManageOnus ? "" : "disabled"}>Show running-config</button>
+        <button type="button" class="secondary-button" data-onu-quick-action="swinfo" ${canManageOnus ? "" : "disabled"}>SW info</button>
+        <button type="button" class="primary-button" data-onu-quick-action="live" ${canManageOnus ? "" : "disabled"}>${liveActive ? "Parar LIVE" : "LIVE PON"}</button>
+        <button type="button" class="secondary-button" data-onu-delete-id="${onu.id}" ${deleteActive || !canManageOnus ? "disabled" : ""}>${deleteActive ? "Excluindo..." : "Excluir ONU"}</button>
       </div>
       ${deleteMessage ? renderOnuDeleteProgress(deleteProgress) : ""}
       ${actionMessage ? `<div class="muted">${actionMessage}</div>` : ""}
@@ -2704,6 +3149,8 @@ function buildRequestResolvedProfileSummary(profileLabel, resolution) {
 }
 
 function renderRequestCard(request) {
+  const canManageRequests = hasPermission("requests_manage");
+  const canPreviewRequests = hasPermission("requests_view");
   const allChoices = buildRequestProvisioningChoices(request);
   const draft = state.requestDraftsById[request.id] || {};
   const availableModes = {
@@ -2774,11 +3221,11 @@ function renderRequestCard(request) {
           <label class="request-field-label">Modo da ONU</label>
           <div class="request-mode-options">
             <label class="request-mode-option ${selectedOnuMode === "bridge" ? "active" : ""} ${availableModes.bridge ? "" : "disabled"}">
-              <input type="radio" name="onu_mode" value="bridge" ${selectedOnuMode === "bridge" ? "checked" : ""} ${availableModes.bridge ? "" : "disabled"}>
+              <input type="radio" name="onu_mode" value="bridge" ${selectedOnuMode === "bridge" ? "checked" : ""} ${availableModes.bridge && canManageRequests ? "" : "disabled"}>
               <span>Bridge</span>
             </label>
             <label class="request-mode-option ${selectedOnuMode === "route" ? "active" : ""} ${availableModes.route ? "" : "disabled"}">
-              <input type="radio" name="onu_mode" value="route" ${selectedOnuMode === "route" ? "checked" : ""} ${availableModes.route ? "" : "disabled"}>
+              <input type="radio" name="onu_mode" value="route" ${selectedOnuMode === "route" ? "checked" : ""} ${availableModes.route && canManageRequests ? "" : "disabled"}>
               <span>Route</span>
             </label>
           </div>
@@ -2787,32 +3234,32 @@ function renderRequestCard(request) {
           name="client_name"
           placeholder="Nome do cliente"
           value="${escapeHtml(readRequestDraftValue(draft, "client_name", request.existing_onu ? request.existing_onu.client_name : ""))}"
-          ${request.existing_onu ? "disabled" : ""}
+          ${request.existing_onu || !canManageRequests ? "disabled" : ""}
         >
         <div class="inline-two">
           <input
             name="neighborhood"
             placeholder="Bairro"
             value="${escapeHtml(readRequestDraftValue(draft, "neighborhood", ""))}"
-            ${request.existing_onu ? "disabled" : ""}
+            ${request.existing_onu || !canManageRequests ? "disabled" : ""}
           >
           <input
             name="city"
             placeholder="Cidade"
             value="${escapeHtml(readRequestDraftValue(draft, "city", ""))}"
-            ${request.existing_onu ? "disabled" : ""}
+            ${request.existing_onu || !canManageRequests ? "disabled" : ""}
           >
         </div>
         <div class="inline-two">
           <div class="request-field">
             <label class="request-field-label">VLAN</label>
-            <select name="vlan_id" ${vlanSelectState.disabled ? "disabled" : ""}>
+            <select name="vlan_id" ${vlanSelectState.disabled || !canManageRequests ? "disabled" : ""}>
               ${vlanSelectState.optionsHtml}
             </select>
           </div>
           <div class="request-field">
             <label class="request-field-label">Perfil de liberacao</label>
-            <select name="profile_choice" data-request-profile-select>
+            <select name="profile_choice" data-request-profile-select ${canManageRequests ? "" : "disabled"}>
               ${renderRequestProvisioningChoiceOptions(choices, selectedChoiceKey)}
             </select>
           </div>
@@ -2829,13 +3276,15 @@ function renderRequestCard(request) {
           </article>
         </div>
         <div class="request-actions">
-          <button type="button" class="secondary-button" data-preview-request-id="${request.id}" ${previewLoading || authorizeRunning ? "disabled" : ""}>
+          <button type="button" class="secondary-button" data-preview-request-id="${request.id}" ${previewLoading || authorizeRunning || !canPreviewRequests ? "disabled" : ""}>
             ${previewLoading ? "Gerando preview..." : "Preview OLT"}
           </button>
           ${
-            request.suggested_action === "move"
-              ? `<button type="button" class="primary-button" data-action="move" data-request-id="${request.id}" ${authorizeRunning ? "disabled" : ""}>Mover ONU</button>`
-              : `<button type="button" class="primary-button" data-action="authorize" data-request-id="${request.id}" ${authorizeRunning ? "disabled" : ""}>${authorizeRunning ? "Autorizando..." : "Autorizar ONU"}</button>`
+            canManageRequests
+              ? request.suggested_action === "move"
+                ? `<button type="button" class="primary-button" data-action="move" data-request-id="${request.id}" ${authorizeRunning ? "disabled" : ""}>Mover ONU</button>`
+                : `<button type="button" class="primary-button" data-action="authorize" data-request-id="${request.id}" ${authorizeRunning ? "disabled" : ""}>${authorizeRunning ? "Autorizando..." : "Autorizar ONU"}</button>`
+              : '<span class="muted">Somente leitura</span>'
           }
         </div>
         ${renderRequestAuthorizeProgress(authorizeProgress)}
@@ -2959,6 +3408,7 @@ function renderRequestPreview(preview) {
 }
 
 function renderConnections() {
+  const canManageCollection = hasPermission("collection_manage");
   if (!state.connections.length) {
     document.getElementById("connectionsList").innerHTML =
       '<div class="muted">Nenhuma conexao cadastrada. Cadastre uma OLT primeiro.</div>';
@@ -3142,17 +3592,25 @@ function renderConnections() {
             <div class="muted">${connection.last_connect_message || "Sem teste de conexao."}</div>
             ${renderConnectionProgress(connection.olt_id)}
             <div class="request-actions">
-              <button type="button" class="secondary-button" data-connection-action="save" data-connection-olt-id="${connection.olt_id}">Salvar conexao</button>
-              <button type="button" class="secondary-button" data-connection-action="apply-template" data-connection-olt-id="${connection.olt_id}">Aplicar template agora</button>
-              <button type="button" class="secondary-button" data-connection-action="apply-template-merge" data-connection-olt-id="${connection.olt_id}">Aplicar sem sobrescrever</button>
-              <button type="button" class="primary-button" data-connection-action="poll" data-connection-olt-id="${connection.olt_id}">Executar poll</button>
+              <button type="button" class="secondary-button" data-connection-action="save" data-connection-olt-id="${connection.olt_id}" ${canManageCollection ? "" : "disabled"}>Salvar conexao</button>
+              <button type="button" class="secondary-button" data-connection-action="apply-template" data-connection-olt-id="${connection.olt_id}" ${canManageCollection ? "" : "disabled"}>Aplicar template agora</button>
+              <button type="button" class="secondary-button" data-connection-action="apply-template-merge" data-connection-olt-id="${connection.olt_id}" ${canManageCollection ? "" : "disabled"}>Aplicar sem sobrescrever</button>
+              <button type="button" class="primary-button" data-connection-action="poll" data-connection-olt-id="${connection.olt_id}" ${canManageCollection ? "" : "disabled"}>Executar poll</button>
             </div>
           </form>
         </article>
       `
     )
     .join("");
-  unlockSnmpFields();
+  if (canManageCollection) {
+    unlockSnmpFields();
+    return;
+  }
+  document
+    .querySelectorAll("form[data-connection-olt-id] input, form[data-connection-olt-id] select, form[data-connection-olt-id] button")
+    .forEach((field) => {
+      field.disabled = true;
+    });
 }
 
 function unlockSnmpFields() {
@@ -3195,6 +3653,7 @@ function renderConnectionTemplates() {
   if (!container) {
     return;
   }
+  const canManageCollection = hasPermission("collection_manage");
   const rows = Array.isArray(state.connectionTemplates) ? state.connectionTemplates : [];
   const newTemplate = {
     id: "new",
@@ -3326,13 +3785,13 @@ function renderConnectionTemplates() {
               <input name="snmp_traffic_up_oid" placeholder="OID up (ifOutOctets)" value="${extra.snmp_traffic_up_oid || ""}">
             </div>
             <div class="request-actions">
-              <button type="button" class="secondary-button" data-template-action="save" data-template-id="${tpl.id}">
+              <button type="button" class="secondary-button" data-template-action="save" data-template-id="${tpl.id}" ${canManageCollection ? "" : "disabled"}>
                 ${isNew ? "Criar template" : "Salvar template"}
               </button>
               ${
                 isNew
                   ? ""
-                  : `<button type="button" class="secondary-button" data-template-action="delete" data-template-id="${tpl.id}">Excluir</button>`
+                  : `<button type="button" class="secondary-button" data-template-action="delete" data-template-id="${tpl.id}" ${canManageCollection ? "" : "disabled"}>Excluir</button>`
               }
             </div>
           </form>
@@ -3340,6 +3799,11 @@ function renderConnectionTemplates() {
       `;
     })
     .join("");
+  if (!canManageCollection) {
+    container.querySelectorAll("input, select, button").forEach((field) => {
+      field.disabled = true;
+    });
+  }
 }
 
 function renderEvents() {
@@ -3363,6 +3827,260 @@ function renderEvents() {
         )
         .join("")
     : '<div class="muted">Sem eventos de coleta.</div>';
+}
+
+function renderUserPermissionCheckboxes(selectedPermissions = {}) {
+  const catalog = Array.isArray(state.permissionCatalog) ? state.permissionCatalog : [];
+  if (!catalog.length) {
+    return '<div class="muted">Sem permissoes disponiveis.</div>';
+  }
+  return catalog
+    .map((item) => {
+      const key = String(item?.key || "").trim();
+      if (!key) {
+        return "";
+      }
+      const checked = Boolean(selectedPermissions?.[key]);
+      return `
+        <label class="checkbox-row">
+          <input type="checkbox" data-permission-key="${escapeHtml(key)}" ${checked ? "checked" : ""}>
+          ${escapeHtml(item?.label || key)}
+        </label>
+      `;
+    })
+    .join("");
+}
+
+function syncUserFormAdminState(form) {
+  if (!form) {
+    return;
+  }
+  const adminInput = form.querySelector("[name='is_admin']");
+  const isAdmin = Boolean(adminInput?.checked);
+  form.querySelectorAll("[data-permission-key]").forEach((input) => {
+    if (isAdmin) {
+      input.checked = true;
+      input.disabled = true;
+      return;
+    }
+    input.disabled = false;
+  });
+}
+
+function getUserPermissionPresets() {
+  const catalogKeys = new Set(
+    (Array.isArray(state.permissionCatalog) ? state.permissionCatalog : [])
+      .map((item) => String(item?.key || "").trim())
+      .filter(Boolean)
+  );
+  return USER_PERMISSION_PRESETS.map((preset) => {
+    const mappedPermissions = Array.isArray(preset.permissions) ? preset.permissions : [];
+    const permissions = catalogKeys.size
+      ? mappedPermissions.filter((key) => catalogKeys.has(key))
+      : mappedPermissions.slice();
+    return {
+      ...preset,
+      permissions: [...new Set(permissions)],
+    };
+  });
+}
+
+function renderCreateUserPresetActions() {
+  const container = document.getElementById("createUserPresetActions");
+  if (!container) {
+    return;
+  }
+  const presets = getUserPermissionPresets();
+  container.innerHTML = presets
+    .map(
+      (preset) => `
+        <button
+          type="button"
+          class="secondary-button"
+          data-user-preset-key="${escapeHtml(preset.key)}"
+          title="${escapeHtml(preset.description || "")}"
+        >
+          ${escapeHtml(preset.label)}
+        </button>
+      `
+    )
+    .join("");
+}
+
+function applyUserPresetToForm(form, presetKey) {
+  if (!form) {
+    return;
+  }
+  const normalizedKey = String(presetKey || "").trim();
+  const preset = getUserPermissionPresets().find((item) => item.key === normalizedKey);
+  if (!preset) {
+    throw new Error("Perfil rapido invalido.");
+  }
+  const selectedPermissions = new Set(Array.isArray(preset.permissions) ? preset.permissions : []);
+  form.querySelectorAll("[data-permission-key]").forEach((input) => {
+    const key = input.dataset.permissionKey;
+    input.checked = selectedPermissions.has(key);
+  });
+  const adminInput = form.querySelector("[name='is_admin']");
+  if (adminInput) {
+    adminInput.checked = Boolean(preset.is_admin);
+  }
+  syncUserFormAdminState(form);
+}
+
+function renderUsers() {
+  const usersListNode = document.getElementById("usersList");
+  const createForm = document.getElementById("createUserForm");
+  const summaryNode = document.getElementById("usersSummary");
+  if (!usersListNode || !createForm || !summaryNode) {
+    return;
+  }
+
+  renderUserPermissionInputs(
+    createForm,
+    state.permissionCatalog,
+    collectPermissionsFromForm(createForm)
+  );
+  renderCreateUserPresetActions();
+  syncUserFormAdminState(createForm);
+
+  const canViewUsers = hasPermission("users_view");
+  const canManageUsers = hasPermission("users_manage");
+  createForm.classList.toggle("hidden", !canManageUsers);
+
+  if (!canViewUsers) {
+    summaryNode.textContent = "Acesso restrito";
+    usersListNode.innerHTML = '<div class="muted">Sem permissao para visualizar usuarios.</div>';
+    return;
+  }
+
+  summaryNode.textContent = `${state.users.length} usuario(s)`;
+  if (!state.users.length) {
+    usersListNode.innerHTML = '<div class="muted">Nenhum usuario cadastrado.</div>';
+    return;
+  }
+
+  usersListNode.innerHTML = state.users
+    .map((user) => {
+      const isCurrent = Number(user.id) === Number(state.auth?.user?.id);
+      return `
+        <article class="user-card">
+          <div class="user-card-head">
+            <strong>${escapeHtml(user.display_name || user.username)}</strong>
+            <span class="status-pill ${user.is_active ? "ok" : "warning"}">${user.is_active ? "ativo" : "inativo"}</span>
+          </div>
+          <div class="muted">Login: ${escapeHtml(user.username)}${isCurrent ? " (voce)" : ""}</div>
+          <div class="muted">Ultimo login: ${user.last_login_at ? escapeHtml(formatDateTime(user.last_login_at)) : "-"}</div>
+          <form class="stack-list" data-user-id="${user.id}">
+            <div class="inline-three">
+              <input name="username" class="search" value="${escapeHtml(user.username)}" placeholder="Login">
+              <input name="display_name" class="search" value="${escapeHtml(user.display_name || "")}" placeholder="Nome de exibicao">
+              <input name="password" type="password" class="search" placeholder="Nova senha (opcional)">
+            </div>
+            <div class="inline-two">
+              <label class="checkbox-row">
+                <input type="checkbox" name="is_active" ${user.is_active ? "checked" : ""}>
+                Usuario ativo
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" name="is_admin" ${user.is_admin ? "checked" : ""}>
+                Administrador
+              </label>
+            </div>
+            <div class="user-permission-grid" data-permission-container>
+              ${renderUserPermissionCheckboxes(user.permissions || {})}
+            </div>
+            <div class="request-actions">
+              <button type="button" class="secondary-button" data-user-action="save" data-user-id="${user.id}" ${
+                canManageUsers ? "" : "disabled"
+              }>
+                Salvar usuario
+              </button>
+              <button type="button" class="secondary-button" data-user-action="delete" data-user-id="${user.id}" ${
+                isCurrent || !canManageUsers ? "disabled" : ""
+              }>
+                Excluir
+              </button>
+            </div>
+          </form>
+        </article>
+      `;
+    })
+    .join("");
+
+  document.querySelectorAll("form[data-user-id]").forEach((form) => {
+    syncUserFormAdminState(form);
+    if (!canManageUsers) {
+      form.querySelectorAll("input, select, button").forEach((node) => {
+        node.disabled = true;
+      });
+    }
+  });
+}
+
+async function createUser() {
+  requirePermission("users_manage", "Sem permissao para criar usuarios.");
+  const form = document.getElementById("createUserForm");
+  if (!form) {
+    return;
+  }
+  const body = {
+    username: form.username.value.trim(),
+    display_name: form.display_name.value.trim(),
+    password: form.password.value,
+    is_admin: Boolean(form.is_admin.checked),
+    is_active: true,
+    permissions: collectPermissionsFromForm(form),
+  };
+  const result = await fetchJson("/api/users", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  if (Array.isArray(result?.permission_catalog) && result.permission_catalog.length) {
+    state.permissionCatalog = result.permission_catalog;
+  }
+  form.reset();
+  renderUserPermissionInputs(form, state.permissionCatalog, {});
+  syncUserFormAdminState(form);
+  await loadData();
+}
+
+async function updateUser(userId) {
+  requirePermission("users_manage", "Sem permissao para editar usuarios.");
+  const form = document.querySelector(`form[data-user-id="${Number(userId)}"]`);
+  if (!form) {
+    return;
+  }
+  const body = {
+    username: form.username.value.trim(),
+    display_name: form.display_name.value.trim(),
+    password: form.password.value,
+    is_admin: Boolean(form.is_admin.checked),
+    is_active: Boolean(form.is_active.checked),
+    permissions: collectPermissionsFromForm(form),
+  };
+  const result = await fetchJson(`/api/users/${Number(userId)}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+  if (Array.isArray(result?.permission_catalog) && result.permission_catalog.length) {
+    state.permissionCatalog = result.permission_catalog;
+  }
+  await loadData();
+}
+
+async function deleteUser(userId) {
+  requirePermission("users_manage", "Sem permissao para excluir usuarios.");
+  const normalized = Number(userId);
+  if (!normalized) {
+    return;
+  }
+  const confirmed = window.confirm("Excluir este usuario?");
+  if (!confirmed) {
+    return;
+  }
+  await fetchJson(`/api/users/${normalized}`, { method: "DELETE" });
+  await loadData();
 }
 
 function buildRequestFormPayload(requestId) {
@@ -3396,6 +4114,7 @@ function buildRequestFormPayload(requestId) {
 }
 
 async function processRequest(requestId, action) {
+  requirePermission("requests_manage", "Sem permissao para executar solicitacoes.");
   const normalizedRequestId = Number(requestId);
   const body = buildRequestFormPayload(normalizedRequestId);
   if (action === "authorize") {
@@ -3410,6 +4129,7 @@ async function processRequest(requestId, action) {
 }
 
 async function runRequestAuthorizationOperation(requestId, body) {
+  requirePermission("requests_manage", "Sem permissao para autorizar solicitacoes.");
   const normalizedRequestId = Number(requestId);
   state.requestAuthorizeProgressById[normalizedRequestId] = {
     status: "running",
@@ -3468,6 +4188,7 @@ async function monitorRequestAuthorizationProgress(requestId) {
 }
 
 async function previewRequestProvisioning(requestId) {
+  requirePermission("requests_view", "Sem permissao para visualizar preview.");
   const body = buildRequestFormPayload(requestId);
   state.requestPreviewLoadingById[requestId] = true;
   renderRequests();
@@ -3485,6 +4206,7 @@ async function previewRequestProvisioning(requestId) {
 }
 
 async function runAutofindAllRequests() {
+  requirePermission("requests_manage", "Sem permissao para executar autofind.");
   state.requestsOperationStatus = {
     type: "autofind",
     status: "running",
@@ -3520,6 +4242,7 @@ async function runAutofindAllRequests() {
 }
 
 async function syncOltProfilesForRequests() {
+  requirePermission("requests_manage", "Sem permissao para sincronizar perfis.");
   state.requestsOperationStatus = {
     type: "profile-sync",
     status: "running",
@@ -3555,6 +4278,7 @@ async function syncOltProfilesForRequests() {
 }
 
 async function saveConnection(oltId) {
+  requirePermission("collection_manage", "Sem permissao para editar conexoes.");
   const form = document.querySelector(`form[data-connection-olt-id="${oltId}"]`);
   const read = (name) => form.querySelector(`[name="${name}"]`);
   const currentConnection = state.connections.find((item) => item.olt_id === oltId) || {};
@@ -3616,6 +4340,7 @@ async function saveConnection(oltId) {
 }
 
 async function applyConnectionTemplateNow(oltId) {
+  requirePermission("collection_manage", "Sem permissao para aplicar template.");
   await fetchJson(`/api/connections/${oltId}/apply-template`, {
     method: "POST",
     body: JSON.stringify({ overwrite: true }),
@@ -3624,6 +4349,7 @@ async function applyConnectionTemplateNow(oltId) {
 }
 
 async function applyConnectionTemplateMerge(oltId) {
+  requirePermission("collection_manage", "Sem permissao para aplicar template.");
   await fetchJson(`/api/connections/${oltId}/apply-template`, {
     method: "POST",
     body: JSON.stringify({ overwrite: false }),
@@ -3632,6 +4358,7 @@ async function applyConnectionTemplateMerge(oltId) {
 }
 
 async function saveConnectionTemplate(templateId) {
+  requirePermission("collection_manage", "Sem permissao para editar templates de conexao.");
   const form = document.querySelector(`form[data-template-id="${templateId}"]`);
   if (!form) {
     return;
@@ -3678,6 +4405,7 @@ async function saveConnectionTemplate(templateId) {
 }
 
 async function deleteConnectionTemplate(templateId) {
+  requirePermission("collection_manage", "Sem permissao para excluir templates.");
   const normalized = Number(templateId);
   if (!normalized) {
     return;
@@ -3693,6 +4421,7 @@ async function deleteConnectionTemplate(templateId) {
 }
 
 async function createOlt() {
+  requirePermission("olts_manage", "Sem permissao para criar OLT.");
   const form = document.getElementById("createOltForm");
   const body = {
     name: form.name.value.trim(),
@@ -3720,6 +4449,7 @@ async function createOlt() {
 }
 
 async function updateOlt() {
+  requirePermission("olts_manage", "Sem permissao para editar OLT.");
   const form = document.getElementById("createOltForm");
   const oltId = Number(form.editing_olt_id.value || state.activeOltId);
   if (!oltId) {
@@ -3750,6 +4480,7 @@ async function updateOlt() {
 }
 
 async function deleteOlt(oltId) {
+  requirePermission("olts_manage", "Sem permissao para excluir OLT.");
   await fetchJson(`/api/olts/${oltId}`, { method: "DELETE" });
   if (state.activeOltId === oltId) {
     state.activeOltId = null;
@@ -3758,6 +4489,7 @@ async function deleteOlt(oltId) {
 }
 
 async function addOltVlan() {
+  requirePermission("olts_manage", "Sem permissao para adicionar VLAN.");
   const oltId = Number(state.activeOltId);
   if (!oltId) {
     throw new Error("Selecione uma OLT para adicionar VLAN.");
@@ -3779,6 +4511,7 @@ async function addOltVlan() {
 }
 
 async function saveOltVlan(vlanId, name, description) {
+  requirePermission("olts_manage", "Sem permissao para editar VLAN.");
   const oltId = Number(state.activeOltId);
   if (!oltId) {
     throw new Error("Selecione uma OLT para salvar VLAN.");
@@ -3797,6 +4530,7 @@ async function saveOltVlan(vlanId, name, description) {
 }
 
 async function deleteOltVlan(vlanId) {
+  requirePermission("olts_manage", "Sem permissao para remover VLAN.");
   const oltId = Number(state.activeOltId);
   if (!oltId) {
     throw new Error("Selecione uma OLT para remover VLAN.");
@@ -3807,6 +4541,7 @@ async function deleteOltVlan(vlanId) {
 }
 
 async function deleteOnu(onuId) {
+  requirePermission("onus_manage", "Sem permissao para excluir ONU.");
   const normalizedOnuId = Number(onuId);
   let removedOnlyLocally = false;
   try {
@@ -3887,6 +4622,7 @@ async function monitorOnuDeleteProgress(onuId) {
 }
 
 async function connectOlt() {
+  requirePermission("collection_manage", "Sem permissao para conectar/coletar OLT.");
   const form = document.getElementById("createOltForm");
   const oltId = Number(form.editing_olt_id.value || state.activeOltId);
   if (!oltId) {
@@ -3918,6 +4654,7 @@ async function connectOlt() {
 }
 
 async function pollOlt(oltId) {
+  requirePermission("collection_manage", "Sem permissao para executar poll.");
   const pollTriggerPromise = fetchJson(`/api/olts/${oltId}/poll`, {
     method: "POST",
     body: "{}",
@@ -3956,6 +4693,7 @@ async function collectOnuLive(
   onuId,
   fields = ["signal", "signal_tx", "signal_olt_rx", "temperature", "vlan", "status", "profile"]
 ) {
+  requirePermission("onus_manage", "Sem permissao para coletar dados LIVE da ONU.");
   const normalizedOnuId = Number(onuId);
   if (!normalizedOnuId) {
     return null;
@@ -4011,6 +4749,7 @@ async function collectOnuLive(
 }
 
 async function executeOnuQuickAction(onuId, action, options = {}) {
+  requirePermission("onus_manage", "Sem permissao para executar acao na ONU.");
   const normalizedOnuId = Number(onuId);
   if (!normalizedOnuId) {
     return null;
@@ -4249,6 +4988,7 @@ async function monitorPollProgress(oltId, pollTriggerPromise) {
 }
 
 async function syncData() {
+  requirePermission("collection_manage", "Sem permissao para sincronizacao geral.");
   const result = await fetchJson("/api/sync", { method: "POST", body: "{}" });
   document.getElementById("lastSync").textContent = `Ultima coleta geral: ${formatDateTime(result.updated_at)}`;
   await loadData();
@@ -4415,11 +5155,44 @@ function buildLiveSparkline(series) {
 function bindEvents() {
   document.querySelectorAll(".tab-button").forEach((button) => {
     button.addEventListener("click", () => {
-      document.querySelectorAll(".tab-button").forEach((item) => item.classList.remove("active"));
-      document.querySelectorAll(".tab-panel").forEach((item) => item.classList.remove("active"));
-      button.classList.add("active");
-      document.getElementById(button.dataset.tab).classList.add("active");
+      activateTab(button.dataset.tab);
     });
+  });
+
+  const loginForm = document.getElementById("loginForm");
+  loginForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await performLogin();
+    } catch (error) {
+      setAuthStatus(error.message || "Falha no login.", true);
+    }
+  });
+
+  const bootstrapForm = document.getElementById("bootstrapForm");
+  bootstrapForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await performBootstrap();
+    } catch (error) {
+      setAuthStatus(error.message || "Falha ao criar administrador.", true);
+    }
+  });
+
+  document.getElementById("logoutButton")?.addEventListener("click", async () => {
+    try {
+      await performLogout();
+    } catch (error) {
+      setAuthStatus(error.message || "Falha ao encerrar sessao.", true);
+    }
+  });
+
+  document.getElementById("createUserButton")?.addEventListener("click", async () => {
+    try {
+      await createUser();
+    } catch (error) {
+      alert(error.message);
+    }
   });
 
   document.getElementById("syncButton").addEventListener("click", async () => {
@@ -4530,6 +5303,14 @@ function bindEvents() {
   });
 
   document.body.addEventListener("change", (event) => {
+    if (event.target && event.target.matches("#createUserForm [name='is_admin']")) {
+      syncUserFormAdminState(document.getElementById("createUserForm"));
+      return;
+    }
+    if (event.target && event.target.matches("form[data-user-id] [name='is_admin']")) {
+      syncUserFormAdminState(event.target.closest("form[data-user-id]"));
+      return;
+    }
     if (event.target && event.target.id === "oltVlanSelect") {
       state.selectedOltVlanId = Number(event.target.value || 0) || null;
       renderOltVlans();
@@ -4721,6 +5502,35 @@ function bindEvents() {
       return;
     }
 
+    const userPresetButton = event.target.closest("[data-user-preset-key]");
+    if (userPresetButton) {
+      try {
+        requirePermission("users_manage", "Sem permissao para aplicar perfil rapido.");
+        applyUserPresetToForm(
+          document.getElementById("createUserForm"),
+          userPresetButton.dataset.userPresetKey
+        );
+      } catch (error) {
+        alert(error.message);
+      }
+      return;
+    }
+
+    const userButton = event.target.closest("[data-user-action]");
+    if (userButton) {
+      try {
+        const userId = Number(userButton.dataset.userId);
+        if (userButton.dataset.userAction === "save") {
+          await updateUser(userId);
+        } else if (userButton.dataset.userAction === "delete") {
+          await deleteUser(userId);
+        }
+      } catch (error) {
+        alert(error.message);
+      }
+      return;
+    }
+
     const deleteButton = event.target.closest("[data-delete-olt-id]");
     if (deleteButton) {
       try {
@@ -4790,7 +5600,7 @@ function bindEvents() {
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
   try {
-    await loadData();
+    await ensureAuthenticatedAndLoad();
   } catch (error) {
     document.body.innerHTML = `<main class="page-shell"><article class="panel"><h1>Falha ao carregar</h1><p>${error.message}</p></article></main>`;
   }

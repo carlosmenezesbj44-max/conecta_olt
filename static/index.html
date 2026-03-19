@@ -7,12 +7,40 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <div class="page-shell">
+  <section id="authScreen" class="auth-screen hidden" aria-live="polite">
+    <article class="auth-card">
+      <img src="/conectaolt-logo.svg" alt="Conecta OLT" class="auth-logo">
+      <h1>ConectaOLT</h1>
+      <p class="muted">Acesse o workspace com seu usuario.</p>
+
+      <form id="loginForm" class="stack-list">
+        <input name="username" class="search" placeholder="Usuario" autocomplete="username">
+        <input name="password" type="password" class="search" placeholder="Senha" autocomplete="current-password">
+        <button type="submit" id="loginButton" class="primary-button">Entrar</button>
+      </form>
+
+      <form id="bootstrapForm" class="stack-list hidden">
+        <strong>Primeiro acesso</strong>
+        <p class="muted">Crie o usuario administrador inicial para habilitar o sistema.</p>
+        <input name="username" class="search" placeholder="Usuario administrador" autocomplete="username">
+        <input name="display_name" class="search" placeholder="Nome de exibicao">
+        <input name="password" type="password" class="search" placeholder="Senha (minimo 6)" autocomplete="new-password">
+        <button type="submit" id="bootstrapButton" class="primary-button">Criar administrador</button>
+      </form>
+      <p id="authStatus" class="muted"></p>
+    </article>
+  </section>
+
+  <div id="appShell" class="page-shell hidden">
     <header class="hero">
       <div class="hero-main">
         <div class="hero-brandbar">
           <img src="/conectaolt-logo.svg" alt="Conecta OLT" class="brand-logo">
-          <span class="hero-suite-badge">NOC Workspace</span>
+          <div class="hero-suite-wrap">
+            <span class="hero-suite-badge">NOC Workspace</span>
+            <span id="sessionUserBadge" class="hero-user-badge hidden"></span>
+            <button type="button" id="logoutButton" class="secondary-button hero-logout hidden">Sair</button>
+          </div>
         </div>
         <div class="hero-heading">
           <div class="hero-copyblock">
@@ -82,6 +110,7 @@
       <button class="tab-button" data-tab="onus">ONUs</button>
       <button class="tab-button" data-tab="requests">Solicitacoes</button>
       <button class="tab-button" data-tab="collection">Coleta</button>
+      <button class="tab-button" data-tab="users" id="usersTabButton">Usuarios</button>
     </nav>
 
     <main>
@@ -285,6 +314,35 @@
             <div id="eventsList" class="stack-list"></div>
           </article>
         </div>
+      </section>
+
+      <section class="tab-panel" id="users">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Usuarios e permissoes</h2>
+            <span id="usersSummary" class="muted"></span>
+          </div>
+          <form id="createUserForm" class="stack-list">
+            <div class="inline-three">
+              <input name="username" class="search" placeholder="Login do usuario">
+              <input name="display_name" class="search" placeholder="Nome de exibicao">
+              <input name="password" type="password" class="search" placeholder="Senha inicial">
+            </div>
+            <div class="request-note">
+              <strong>Perfis rapidos</strong>
+              <div id="createUserPresetActions" class="request-actions"></div>
+            </div>
+            <label class="checkbox-row">
+              <input type="checkbox" name="is_admin">
+              Administrador (acesso total)
+            </label>
+            <div id="userPermissionGrid" class="user-permission-grid"></div>
+            <div class="request-actions">
+              <button type="button" id="createUserButton" class="primary-button">Criar usuario</button>
+            </div>
+          </form>
+          <div id="usersList" class="stack-list"></div>
+        </article>
       </section>
     </main>
   </div>
