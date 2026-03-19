@@ -2,7 +2,7 @@ import os
 import sys
 
 # Adiciona o diretório do projeto ao sys.path para que os módulos internos sejam encontrados
-path = os.path.expanduser('~/conecta_olt')
+path = '/home/carlosviptelecom/conecta_olt'
 if path not in sys.path:
     sys.path.insert(0, path)
 
