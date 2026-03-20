@@ -98,6 +98,27 @@ TEMPLATE_EXTRA_KEYS = {
     "collector_profile_detected",
 }
 TEMPLATE_COMMAND_OVERRIDE_KEYS = ("ont_summary", "service_port", "vlan_inventory")
+TEMPLATE_DEFAULT_KEYS = {
+    "protocol",
+    "transport_type",
+    "username",
+    "password",
+    "api_base_url",
+    "api_token",
+    "source_path",
+    "command_line",
+    "port",
+    "poll_interval_sec",
+    "command_timeout_sec",
+    "verify_tls",
+    "enabled",
+    "status",
+    "board_model",
+    "board_slots",
+    "ports_per_board",
+    "capacity_onu",
+}
+TEMPLATE_SECRET_DEFAULT_KEYS = {"password", "api_token"}
 
 BUILTIN_CONNECTION_TEMPLATES = [
     {
@@ -468,6 +489,7 @@ def init_db():
                 model TEXT NOT NULL,
                 firmware TEXT NOT NULL,
                 extra_config TEXT NOT NULL,
+                defaults_json TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL,
                 UNIQUE(brand, model, firmware)
             );
@@ -500,6 +522,7 @@ def init_db():
         ensure_connection_columns(connection)
         ensure_onu_columns(connection)
         ensure_auth_columns(connection)
+        ensure_connection_template_columns(connection)
         ensure_connection_templates(connection)
         ensure_phase2_records(connection)
 
@@ -634,6 +657,18 @@ def ensure_connection_columns(connection):
           AND LOWER(COALESCE(transport_type, 'ssh')) IN ('ssh', 'telnet')
         """
     )
+    connection.commit()
+
+
+def ensure_connection_template_columns(connection):
+    existing_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(olt_connection_template)").fetchall()
+    }
+    if "defaults_json" not in existing_columns:
+        connection.execute(
+            "ALTER TABLE olt_connection_template ADD COLUMN defaults_json TEXT NOT NULL DEFAULT '{}'"
+        )
     connection.commit()
 
 
@@ -1291,6 +1326,35 @@ def _normalize_template_extra_value(key, value):
     return value
 
 
+def _normalize_template_default_value(key, value, encrypt_secrets=False):
+    if key not in TEMPLATE_DEFAULT_KEYS:
+        return None
+    if key in TEMPLATE_SECRET_DEFAULT_KEYS:
+        if encrypt_secrets:
+            stripped = str(value or "").strip()
+            return encrypt_secret(stripped or None) if stripped else None
+        return value if value not in (None, "", []) else None
+    if key in {"verify_tls", "enabled"}:
+        if value is None:
+            return None
+        return bool(value)
+    if key in {"port", "poll_interval_sec", "command_timeout_sec", "ports_per_board", "capacity_onu"}:
+        if value in (None, "", []):
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+    if key == "board_slots":
+        if isinstance(value, (list, tuple)):
+            joined = ",".join(str(item).strip() for item in value if str(item).strip())
+            return joined or None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else None
+    return value
+
+
 def _filter_template_extra(extra_config):
     filtered = {}
     source = extra_config or {}
@@ -1298,6 +1362,19 @@ def _filter_template_extra(extra_config):
         if key not in TEMPLATE_EXTRA_KEYS:
             continue
         value = _normalize_template_extra_value(key, raw_value)
+        if not _is_meaningful_template_value(value):
+            continue
+        filtered[key] = value
+    return filtered
+
+
+def _filter_template_defaults(defaults, encrypt_secrets=False):
+    filtered = {}
+    source = defaults or {}
+    for key, raw_value in source.items():
+        if key not in TEMPLATE_DEFAULT_KEYS:
+            continue
+        value = _normalize_template_default_value(key, raw_value, encrypt_secrets=encrypt_secrets)
         if not _is_meaningful_template_value(value):
             continue
         filtered[key] = value
@@ -1314,7 +1391,23 @@ def _merge_missing_template_values(current_extra, template_extra):
     return merged
 
 
-def _fetch_connection_template(connection, brand, model, firmware):
+def _merge_missing_template_defaults(current_defaults, template_defaults):
+    merged = dict(template_defaults or {})
+    merged.update({k: v for k, v in (current_defaults or {}).items() if v not in (None, "", [])})
+    for key, value in (current_defaults or {}).items():
+        if value in (False, 0):
+            merged[key] = value
+    return merged
+
+
+def _public_template_defaults(defaults):
+    public = dict(defaults or {})
+    for key in TEMPLATE_SECRET_DEFAULT_KEYS:
+        public[key] = decrypt_secret(public.get(key))
+    return public
+
+
+def _fetch_connection_template_bundle(connection, brand, model, firmware):
     brand_n = _normalize_identity(brand)
     model_n = _normalize_identity(model)
     firmware_n = _normalize_identity(firmware)
@@ -1323,27 +1416,95 @@ def _fetch_connection_template(connection, brand, model, firmware):
         (brand_n, model_n, "*"),
         (brand_n, model_n, firmware_n),
     ]
-    merged = {}
+    merged_extra = {}
+    merged_defaults = {}
     for current_brand, current_model, current_firmware in candidates:
         if not current_brand:
             continue
         row = connection.execute(
             """
-            SELECT extra_config
+            SELECT extra_config, defaults_json
             FROM olt_connection_template
             WHERE brand = ? AND model = ? AND firmware = ?
             """,
             (current_brand, current_model or "*", current_firmware or "*"),
         ).fetchone()
         if row:
-            current = _deserialize_extra(row["extra_config"])
-            for key, value in current.items():
+            current_extra = _deserialize_extra(row["extra_config"])
+            current_defaults = _deserialize_extra(row["defaults_json"])
+            for key, value in current_extra.items():
                 if value not in (None, "", []):
-                    merged[key] = value
-    return merged
+                    merged_extra[key] = value
+            for key, value in current_defaults.items():
+                if value not in (None, "", []):
+                    merged_defaults[key] = value
+    return {
+        "extra_config": merged_extra,
+        "defaults": merged_defaults,
+    }
 
 
-def _upsert_connection_template(connection, brand, model, firmware, extra_config):
+def _fetch_connection_template(connection, brand, model, firmware):
+    return _fetch_connection_template_bundle(connection, brand, model, firmware).get("extra_config") or {}
+
+
+def _extract_template_defaults_from_existing(connection, olt_id, row):
+    row_data = dict(row or {})
+    board_rows = connection.execute(
+        """
+        SELECT board.slot, board.model, board.ports_total, pon_port.capacity_onu
+        FROM board
+        LEFT JOIN pon_port ON pon_port.board_id = board.id
+        WHERE board.olt_id = ?
+        ORDER BY board.slot, pon_port.id
+        """,
+        (int(olt_id),),
+    ).fetchall()
+    board_slots = []
+    board_model = None
+    ports_per_board = None
+    capacity_onu = None
+    for board in board_rows:
+        slot = str(board["slot"] or "").strip()
+        if slot and slot not in board_slots:
+            board_slots.append(slot)
+        if board_model is None and board["model"]:
+            board_model = str(board["model"]).strip() or None
+        if ports_per_board is None and board["ports_total"] is not None:
+            try:
+                ports_per_board = int(board["ports_total"])
+            except Exception:
+                ports_per_board = None
+        if capacity_onu is None and board["capacity_onu"] is not None:
+            try:
+                capacity_onu = int(board["capacity_onu"])
+            except Exception:
+                capacity_onu = None
+    return _filter_template_defaults(
+        {
+            "protocol": row_data.get("protocol"),
+            "transport_type": row_data.get("transport_type"),
+            "username": row_data.get("username"),
+            "password": row_data.get("password"),
+            "api_base_url": row_data.get("api_base_url"),
+            "api_token": row_data.get("api_token"),
+            "source_path": row_data.get("source_path"),
+            "command_line": row_data.get("command_line"),
+            "port": row_data.get("port"),
+            "poll_interval_sec": row_data.get("poll_interval_sec"),
+            "command_timeout_sec": row_data.get("command_timeout_sec"),
+            "verify_tls": bool(row_data.get("verify_tls")),
+            "enabled": bool(row_data.get("enabled")),
+            "status": row_data.get("olt_status"),
+            "board_model": board_model,
+            "board_slots": ",".join(board_slots),
+            "ports_per_board": ports_per_board,
+            "capacity_onu": capacity_onu,
+        }
+    )
+
+
+def _upsert_connection_template(connection, brand, model, firmware, extra_config, defaults=None):
     identity = (
         _normalize_identity(brand),
         _normalize_identity(model),
@@ -1352,18 +1513,20 @@ def _upsert_connection_template(connection, brand, model, firmware, extra_config
     if not all(identity):
         return
     filtered = _filter_template_extra(extra_config)
-    if not filtered:
+    filtered_defaults = _filter_template_defaults(defaults or {})
+    if not filtered and not filtered_defaults:
         return
     now = utc_now()
     connection.execute(
         """
-        INSERT INTO olt_connection_template (brand, model, firmware, extra_config, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO olt_connection_template (brand, model, firmware, extra_config, defaults_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(brand, model, firmware) DO UPDATE SET
             extra_config = excluded.extra_config,
+            defaults_json = excluded.defaults_json,
             updated_at = excluded.updated_at
         """,
-        (*identity, json.dumps(filtered), now),
+        (*identity, json.dumps(filtered), json.dumps(filtered_defaults), now),
     )
 
 
@@ -1375,21 +1538,43 @@ def ensure_connection_templates(connection):
             item.get("model"),
             item.get("firmware"),
             item.get("extra_config") or {},
+            item.get("defaults") or {},
         )
     existing_rows = connection.execute(
         """
-        SELECT olt.brand, olt.model, olt.firmware, connection.extra_config
+        SELECT
+            olt.id AS olt_id,
+            olt.brand,
+            olt.model,
+            olt.firmware,
+            olt.status AS olt_status,
+            connection.protocol,
+            connection.transport_type,
+            connection.enabled,
+            connection.username,
+            connection.password,
+            connection.api_base_url,
+            connection.api_token,
+            connection.source_path,
+            connection.command_line,
+            connection.port,
+            connection.poll_interval_sec,
+            connection.command_timeout_sec,
+            connection.verify_tls,
+            connection.extra_config
         FROM olt_connection connection
         JOIN olt ON olt.id = connection.olt_id
         """
     ).fetchall()
     for row in existing_rows:
+        row_dict = dict(row)
         _upsert_connection_template(
             connection,
-            row["brand"],
-            row["model"],
-            row["firmware"],
-            _deserialize_extra(row["extra_config"]),
+            row_dict["brand"],
+            row_dict["model"],
+            row_dict["firmware"],
+            _deserialize_extra(row_dict["extra_config"]),
+            _extract_template_defaults_from_existing(connection, row_dict["olt_id"], row_dict),
         )
     connection.commit()
 
@@ -2619,6 +2804,15 @@ def _default_collection_protocol(brand, transport_type):
     return "mock"
 
 
+def _prefer_payload_or_template(value, template_value, fallback=None, default_markers=None):
+    markers = tuple(default_markers or ())
+    if value in (None, "", []):
+        return template_value if template_value not in (None, "", []) else fallback
+    if template_value not in (None, "", []) and markers and value in markers:
+        return template_value
+    return value
+
+
 def fetch_olt_context(olt_id):
     with connect() as connection:
         olt = connection.execute(
@@ -2794,7 +2988,7 @@ def fetch_connection_templates():
     with connect() as connection:
         rows = connection.execute(
             """
-            SELECT id, brand, model, firmware, extra_config, updated_at
+            SELECT id, brand, model, firmware, extra_config, defaults_json, updated_at
             FROM olt_connection_template
             ORDER BY brand, model, firmware
             """
@@ -2803,6 +2997,7 @@ def fetch_connection_templates():
         for row in rows:
             item = dict(row)
             item["extra_config"] = _deserialize_extra(item.get("extra_config"))
+            item["defaults"] = _public_template_defaults(_deserialize_extra(item.get("defaults_json")))
             items.append(item)
         return items
 
@@ -2815,7 +3010,8 @@ def save_connection_template(payload):
     if not brand or not model or not firmware:
         raise ValueError("Template exige marca, modelo e firmware.")
     extra_config = _filter_template_extra(payload.get("extra_config") or {})
-    if not extra_config:
+    defaults = _filter_template_defaults(payload.get("defaults") or {}, encrypt_secrets=True)
+    if not extra_config and not defaults:
         raise ValueError("Template sem configuracao valida.")
 
     with connect() as connection:
@@ -2826,10 +3022,10 @@ def save_connection_template(payload):
             ).fetchone()
             if not existing:
                 raise ValueError("Template nao encontrado.")
-        _upsert_connection_template(connection, brand, model, firmware, extra_config)
+        _upsert_connection_template(connection, brand, model, firmware, extra_config, defaults)
         row = connection.execute(
             """
-            SELECT id, brand, model, firmware, extra_config, updated_at
+            SELECT id, brand, model, firmware, extra_config, defaults_json, updated_at
             FROM olt_connection_template
             WHERE brand = ? AND model = ? AND firmware = ?
             """,
@@ -2838,6 +3034,7 @@ def save_connection_template(payload):
         connection.commit()
     item = dict(row)
     item["extra_config"] = _deserialize_extra(item.get("extra_config"))
+    item["defaults"] = _public_template_defaults(_deserialize_extra(item.get("defaults_json")))
     return item
 
 
@@ -2869,29 +3066,177 @@ def create_olt(payload):
     if not all([name, brand, model, host]):
         raise ValueError("Nome, marca, modelo e host sao obrigatorios.")
 
-    board_slots_raw = payload.get("board_slots") or "0/1"
-    board_slots = [
-        slot.strip()
-        for slot in str(board_slots_raw).split(",")
-        if slot.strip()
-    ]
-    if not board_slots:
-        raise ValueError("Informe ao menos um slot de placa.")
-
-    board_model = (payload.get("board_model") or "GPON").strip()
-    ports_per_board = int(payload.get("ports_per_board") or 4)
-    capacity_onu = int(payload.get("capacity_onu") or 128)
-    firmware = (payload.get("firmware") or "").strip() or "N/A"
-    status = (payload.get("status") or "online").strip() or "online"
-    transport_type = (payload.get("transport_type") or "ssh").strip().lower() or "ssh"
-    connection_port = int(payload.get("port") or _default_port_for_transport(transport_type))
-    connection_protocol = _default_collection_protocol(brand, transport_type)
-    username = (payload.get("username") or "").strip() or None
-    password = encrypt_secret((payload.get("password") or "").strip() or None)
-    now = utc_now()
-
     with connect() as connection:
-        template_extra = _fetch_connection_template(connection, brand, model, firmware)
+        template_bundle = _fetch_connection_template_bundle(
+            connection,
+            brand,
+            model,
+            (payload.get("firmware") or "").strip() or "N/A",
+        )
+        template_defaults = template_bundle.get("defaults") or {}
+        firmware = (
+            _prefer_payload_or_template(
+                (payload.get("firmware") or "").strip(),
+                template_defaults.get("firmware"),
+                "N/A",
+            )
+            or "N/A"
+        )
+        board_slots_raw = _prefer_payload_or_template(
+            payload.get("board_slots"),
+            template_defaults.get("board_slots"),
+            "0/1",
+            default_markers=("0/1",),
+        )
+        board_slots = [
+            slot.strip()
+            for slot in str(board_slots_raw or "").split(",")
+            if slot.strip()
+        ]
+        if not board_slots:
+            raise ValueError("Informe ao menos um slot de placa.")
+
+        board_model = (
+            _prefer_payload_or_template(
+                (payload.get("board_model") or "").strip(),
+                template_defaults.get("board_model"),
+                "GPON",
+                default_markers=("GPON",),
+            )
+            or "GPON"
+        )
+        ports_per_board = int(
+            _prefer_payload_or_template(
+                payload.get("ports_per_board"),
+                template_defaults.get("ports_per_board"),
+                4,
+                default_markers=(4, "4"),
+            )
+            or 4
+        )
+        capacity_onu = int(
+            _prefer_payload_or_template(
+                payload.get("capacity_onu"),
+                template_defaults.get("capacity_onu"),
+                128,
+                default_markers=(128, "128"),
+            )
+            or 128
+        )
+        status = (
+            _prefer_payload_or_template(
+                (payload.get("status") or "").strip(),
+                template_defaults.get("status"),
+                "online",
+                default_markers=("online",),
+            )
+            or "online"
+        )
+        transport_type = (
+            _prefer_payload_or_template(
+                (payload.get("transport_type") or "").strip().lower(),
+                template_defaults.get("transport_type"),
+                "ssh",
+                default_markers=("ssh",),
+            )
+            or "ssh"
+        )
+        connection_port = int(
+            _prefer_payload_or_template(
+                payload.get("port"),
+                template_defaults.get("port"),
+                _default_port_for_transport(transport_type),
+                default_markers=(22, "22", 23, "23"),
+            )
+            or _default_port_for_transport(transport_type)
+        )
+        connection_protocol = (
+            _prefer_payload_or_template(
+                (payload.get("protocol") or "").strip().lower(),
+                template_defaults.get("protocol"),
+                _default_collection_protocol(brand, transport_type),
+            )
+            or _default_collection_protocol(brand, transport_type)
+        )
+        username = (
+            _prefer_payload_or_template(
+                (payload.get("username") or "").strip(),
+                template_defaults.get("username"),
+                None,
+            )
+            or None
+        )
+        raw_password = (payload.get("password") or "").strip()
+        password = (
+            encrypt_secret(raw_password or None)
+            if raw_password
+            else template_defaults.get("password")
+        )
+        poll_interval_sec = int(
+            _prefer_payload_or_template(
+                payload.get("poll_interval_sec"),
+                template_defaults.get("poll_interval_sec"),
+                300,
+                default_markers=(300, "300"),
+            )
+            or 300
+        )
+        command_timeout_sec = int(
+            _prefer_payload_or_template(
+                payload.get("command_timeout_sec"),
+                template_defaults.get("command_timeout_sec"),
+                20,
+                default_markers=(20, "20"),
+            )
+            or 20
+        )
+        enabled = bool(
+            _prefer_payload_or_template(
+                payload.get("enabled"),
+                template_defaults.get("enabled"),
+                True,
+                default_markers=(True, "true", "1", 1),
+            )
+        )
+        verify_tls = bool(
+            _prefer_payload_or_template(
+                payload.get("verify_tls"),
+                template_defaults.get("verify_tls"),
+                False,
+            )
+        )
+        api_base_url = (
+            _prefer_payload_or_template(
+                (payload.get("api_base_url") or "").strip(),
+                template_defaults.get("api_base_url"),
+                None,
+            )
+            or None
+        )
+        raw_api_token = (payload.get("api_token") or "").strip()
+        api_token = (
+            encrypt_secret(raw_api_token or None)
+            if raw_api_token
+            else template_defaults.get("api_token")
+        )
+        source_path = (
+            _prefer_payload_or_template(
+                (payload.get("source_path") or "").strip(),
+                template_defaults.get("source_path"),
+                None,
+            )
+            or None
+        )
+        command_line = (
+            _prefer_payload_or_template(
+                (payload.get("command_line") or "").strip(),
+                template_defaults.get("command_line"),
+                None,
+            )
+            or None
+        )
+        now = utc_now()
+        template_extra = template_bundle.get("extra_config") or {}
         merged_extra_config = _merge_missing_template_values(
             {"vendor_hint": brand},
             template_extra,
@@ -2942,16 +3287,54 @@ def create_olt(payload):
                 transport_type, source_path, command_line, port, poll_interval_sec, command_timeout_sec,
                 verify_tls, extra_config, last_poll_status, last_poll_at, last_error,
                 last_connect_status, last_connect_at, last_connect_message
-            ) VALUES (?, ?, 1, ?, ?, NULL, NULL, ?, NULL, NULL, ?, 300, 20, 0, ?, 'idle', NULL, NULL, NULL, NULL, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', NULL, NULL, NULL, NULL, NULL)
             """,
             (
                 olt_id,
                 connection_protocol,
+                1 if enabled else 0,
                 username,
                 password,
+                api_base_url,
+                api_token,
                 transport_type,
+                source_path,
+                command_line,
                 connection_port,
+                poll_interval_sec,
+                command_timeout_sec,
+                1 if verify_tls else 0,
                 json.dumps(merged_extra_config),
+            ),
+        )
+
+        _upsert_connection_template(
+            connection,
+            brand,
+            model,
+            firmware,
+            merged_extra_config,
+            _filter_template_defaults(
+                {
+                    "protocol": connection_protocol,
+                    "transport_type": transport_type,
+                    "username": username,
+                    "password": password,
+                    "api_base_url": api_base_url,
+                    "api_token": api_token,
+                    "source_path": source_path,
+                    "command_line": command_line,
+                    "port": connection_port,
+                    "poll_interval_sec": poll_interval_sec,
+                    "command_timeout_sec": command_timeout_sec,
+                    "verify_tls": verify_tls,
+                    "enabled": enabled,
+                    "status": status,
+                    "board_model": board_model,
+                    "board_slots": ",".join(board_slots),
+                    "ports_per_board": ports_per_board,
+                    "capacity_onu": capacity_onu,
+                }
             ),
         )
 
@@ -3015,6 +3398,15 @@ def update_olt(olt_id, payload):
         current_connection = connection.execute(
             """
             SELECT extra_config
+                 , protocol
+                 , enabled
+                 , api_base_url
+                 , api_token
+                 , source_path
+                 , command_line
+                 , poll_interval_sec
+                 , command_timeout_sec
+                 , verify_tls
             FROM olt_connection
             WHERE olt_id = ?
             """,
@@ -3140,6 +3532,41 @@ def update_olt(olt_id, payload):
                 olt_id,
             ),
         )
+        current_connection_dict = dict(current_connection) if current_connection else {}
+        effective_protocol = (
+            connection_protocol
+            if str(current_connection_dict.get("protocol") or "").strip().lower() == "mock"
+            else current_connection_dict.get("protocol")
+        ) or connection_protocol
+        _upsert_connection_template(
+            connection,
+            brand,
+            model,
+            firmware,
+            merged_extra_config,
+            _filter_template_defaults(
+                {
+                    "protocol": effective_protocol,
+                    "transport_type": transport_type,
+                    "username": username,
+                    "password": password,
+                    "api_base_url": current_connection_dict.get("api_base_url"),
+                    "api_token": current_connection_dict.get("api_token"),
+                    "source_path": current_connection_dict.get("source_path"),
+                    "command_line": current_connection_dict.get("command_line"),
+                    "port": connection_port,
+                    "poll_interval_sec": current_connection_dict.get("poll_interval_sec"),
+                    "command_timeout_sec": current_connection_dict.get("command_timeout_sec"),
+                    "verify_tls": bool(current_connection_dict.get("verify_tls")),
+                    "enabled": bool(current_connection_dict.get("enabled", True)),
+                    "status": status,
+                    "board_model": board_model,
+                    "board_slots": ",".join(sorted(desired_slots)),
+                    "ports_per_board": ports_per_board,
+                    "capacity_onu": capacity_onu,
+                }
+            ),
+        )
         connection.commit()
     return {"status": "updated", "olt_id": olt_id, "olts": fetch_olts()}
 
@@ -3222,12 +3649,40 @@ def save_connection(olt_id, payload):
                 """,
                 (*row, olt_id),
             )
+        template_source = connection.execute(
+            """
+            SELECT
+                olt.id AS olt_id,
+                olt.brand,
+                olt.model,
+                olt.firmware,
+                olt.status AS olt_status,
+                connection.protocol,
+                connection.transport_type,
+                connection.enabled,
+                connection.username,
+                connection.password,
+                connection.api_base_url,
+                connection.api_token,
+                connection.source_path,
+                connection.command_line,
+                connection.port,
+                connection.poll_interval_sec,
+                connection.command_timeout_sec,
+                connection.verify_tls
+            FROM olt_connection connection
+            JOIN olt ON olt.id = connection.olt_id
+            WHERE connection.olt_id = ?
+            """,
+            (int(olt_id),),
+        ).fetchone()
         _upsert_connection_template(
             connection,
             exists["brand"] if exists else "",
             exists["model"] if exists else "",
             exists["firmware"] if exists else "",
             merged_extra_config,
+            _extract_template_defaults_from_existing(connection, int(olt_id), dict(template_source) if template_source else {}),
         )
         connection.commit()
     return fetch_connection_for_olt(olt_id)
@@ -3239,6 +3694,19 @@ def apply_connection_template(olt_id, overwrite=True):
             """
             SELECT
                 connection.olt_id,
+                connection.protocol,
+                connection.transport_type,
+                connection.enabled,
+                connection.username,
+                connection.password,
+                connection.api_base_url,
+                connection.api_token,
+                connection.source_path,
+                connection.command_line,
+                connection.port,
+                connection.poll_interval_sec,
+                connection.command_timeout_sec,
+                connection.verify_tls,
                 connection.extra_config,
                 olt.brand,
                 olt.model,
@@ -3252,30 +3720,73 @@ def apply_connection_template(olt_id, overwrite=True):
         if not row:
             raise ValueError("Conexao da OLT nao encontrada.")
 
+        current_defaults = _filter_template_defaults(
+            {
+                "protocol": row["protocol"],
+                "transport_type": row["transport_type"],
+                "username": row["username"],
+                "password": row["password"],
+                "api_base_url": row["api_base_url"],
+                "api_token": row["api_token"],
+                "source_path": row["source_path"],
+                "command_line": row["command_line"],
+                "port": row["port"],
+                "poll_interval_sec": row["poll_interval_sec"],
+                "command_timeout_sec": row["command_timeout_sec"],
+                "verify_tls": bool(row["verify_tls"]),
+                "enabled": bool(row["enabled"]),
+            }
+        )
         current_extra = _deserialize_extra(row["extra_config"])
-        template_extra = _fetch_connection_template(
+        template_bundle = _fetch_connection_template_bundle(
             connection,
             row["brand"],
             row["model"],
             row["firmware"],
         )
+        template_extra = template_bundle.get("extra_config") or {}
+        template_defaults = template_bundle.get("defaults") or {}
         if not template_extra:
-            raise ValueError("Nenhum template encontrado para esta OLT.")
+            if not template_defaults:
+                raise ValueError("Nenhum template encontrado para esta OLT.")
 
         if overwrite:
             merged_extra = dict(current_extra)
             for key, value in template_extra.items():
                 merged_extra[key] = value
+            merged_defaults = dict(current_defaults)
+            for key, value in template_defaults.items():
+                merged_defaults[key] = value
         else:
             merged_extra = _merge_missing_template_values(current_extra, template_extra)
+            merged_defaults = _merge_missing_template_defaults(current_defaults, template_defaults)
 
         connection.execute(
             """
             UPDATE olt_connection
-            SET extra_config = ?
+            SET protocol = ?, transport_type = ?, enabled = ?, username = ?, password = ?,
+                api_base_url = ?, api_token = ?, source_path = ?, command_line = ?,
+                port = ?, poll_interval_sec = ?, command_timeout_sec = ?, verify_tls = ?,
+                extra_config = ?
             WHERE olt_id = ?
             """,
-            (json.dumps(merged_extra), int(olt_id)),
+            (
+                merged_defaults.get("protocol") or row["protocol"],
+                merged_defaults.get("transport_type") or row["transport_type"],
+                1 if bool(merged_defaults.get("enabled", row["enabled"])) else 0,
+                merged_defaults.get("username"),
+                merged_defaults.get("password"),
+                merged_defaults.get("api_base_url"),
+                merged_defaults.get("api_token"),
+                merged_defaults.get("source_path"),
+                merged_defaults.get("command_line"),
+                int(merged_defaults.get("port") or row["port"] or 0),
+                int(merged_defaults.get("poll_interval_sec") or row["poll_interval_sec"] or 300),
+                int(merged_defaults.get("command_timeout_sec") or row["command_timeout_sec"] or 20),
+                1 if bool(merged_defaults.get("verify_tls", row["verify_tls"])) else 0,
+                json.dumps(merged_extra),
+                int(olt_id),
+            ),
         )
         connection.commit()
     return fetch_connection_for_olt(int(olt_id))

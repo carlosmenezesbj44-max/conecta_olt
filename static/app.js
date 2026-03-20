@@ -828,7 +828,7 @@ function resolveTemplateExtraForIdentity(brand, model, firmware, catalogIndex = 
   const modelIdentity = normalizeTemplateIdentity(model);
   const firmwareIdentity = normalizeTemplateIdentity(firmware);
   if (!brandIdentity) {
-    return { extra: {}, matched: [] };
+    return { extra: {}, defaults: {}, matched: [] };
   }
 
   const candidates = [
@@ -838,6 +838,7 @@ function resolveTemplateExtraForIdentity(brand, model, firmware, catalogIndex = 
   ];
 
   const extra = {};
+  const defaults = {};
   const matched = [];
   candidates.forEach(([candidateBrand, candidateModel, candidateFirmware]) => {
     const template = index.templatesByKey.get(`${candidateBrand}|${candidateModel}|${candidateFirmware}`);
@@ -857,8 +858,48 @@ function resolveTemplateExtraForIdentity(brand, model, firmware, catalogIndex = 
       }
       extra[key] = value;
     });
+    const templateDefaults = template.defaults || {};
+    Object.entries(templateDefaults).forEach(([key, value]) => {
+      if (!isTemplateValuePresent(value)) {
+        return;
+      }
+      defaults[key] = value;
+    });
   });
-  return { extra, matched };
+  return { extra, defaults, matched };
+}
+
+function applyResolvedTemplateToOltForm(form, resolved) {
+  if (!form || !resolved || !resolved.matched?.length) {
+    return;
+  }
+  const defaults = resolved.defaults || {};
+  const setValue = (name, value) => {
+    if (!isTemplateValuePresent(value)) {
+      return;
+    }
+    const field = form.querySelector(`[name='${name}']`);
+    if (!field) {
+      return;
+    }
+    field.value = value;
+  };
+
+  setValue("username", defaults.username);
+  setValue("password", defaults.password);
+  if (isTemplateValuePresent(defaults.transport_type)) {
+    const transportField = form.querySelector("[name='transport_type']");
+    if (transportField) {
+      transportField.value = defaults.transport_type;
+      transportField.dataset.lastTransport = defaults.transport_type;
+    }
+  }
+  setValue("port", defaults.port);
+  setValue("status", defaults.status);
+  setValue("board_model", defaults.board_model);
+  setValue("board_slots", defaults.board_slots);
+  setValue("ports_per_board", defaults.ports_per_board);
+  setValue("capacity_onu", defaults.capacity_onu);
 }
 
 function countTemplateOidEntries(extraConfig) {
@@ -957,9 +998,15 @@ function refreshOltTemplateCatalog() {
   ).trim();
   const oidCount = countTemplateOidEntries(resolved.extra);
   const commandCount = countTemplateCommandEntries(resolved.extra);
+  const transportLabel = resolved.defaults?.transport_type
+    ? `${String(resolved.defaults.transport_type).toUpperCase()}:${resolved.defaults.port || "-"}`
+    : "n/d";
+  const boardLabel = resolved.defaults?.board_slots
+    ? `${resolved.defaults.board_model || "placa"} @ ${resolved.defaults.board_slots}`
+    : "n/d";
   summaryNode.textContent =
     `Template ativo: ${matchedScopes}. ` +
-    `Perfil CLI: ${profile}. OIDs: ${oidCount}. Comandos: ${commandCount}.`;
+    `Perfil CLI: ${profile}. Transporte: ${transportLabel}. Placas: ${boardLabel}. OIDs: ${oidCount}. Comandos: ${commandCount}.`;
 }
 
 function applyOltTemplateCatalogSelection(level) {
@@ -998,6 +1045,12 @@ function applyOltTemplateCatalogSelection(level) {
     form.firmware.value = firmware ? formatCatalogIdentity(firmware, "firmware") : "";
   }
 
+  const resolved = resolveTemplateExtraForIdentity(
+    form.brand.value,
+    form.model.value,
+    form.firmware.value
+  );
+  applyResolvedTemplateToOltForm(form, resolved);
   refreshOltTemplateCatalog();
 }
 
@@ -3789,6 +3842,26 @@ function renderConnectionTemplates() {
     brand: "",
     model: "",
     firmware: "",
+    defaults: {
+      protocol: "native",
+      transport_type: "ssh",
+      username: "",
+      password: "",
+      api_base_url: "",
+      api_token: "",
+      source_path: "",
+      command_line: "",
+      port: 22,
+      poll_interval_sec: 300,
+      command_timeout_sec: 20,
+      enabled: true,
+      verify_tls: false,
+      status: "online",
+      board_model: "GPON",
+      board_slots: "0/1",
+      ports_per_board: 4,
+      capacity_onu: 128,
+    },
     extra_config: {
       collector_profile: "auto",
       snmp_version: "2c",
@@ -3817,6 +3890,7 @@ function renderConnectionTemplates() {
   container.innerHTML = cards
     .map((tpl) => {
       const extra = tpl.extra_config || {};
+      const defaults = tpl.defaults || {};
       const isNew = String(tpl.id) === "new";
       return `
         <article class="connection-card">
@@ -3827,10 +3901,59 @@ function renderConnectionTemplates() {
             </div>
             <div class="inline-two">
               <input name="firmware" placeholder="Firmware" value="${tpl.firmware || ""}">
+              <select name="transport_type">
+                ${["ssh", "telnet", "api"]
+                  .map(
+                    (value) => `
+                      <option value="${value}" ${(defaults.transport_type || "ssh") === value ? "selected" : ""}>
+                        Transporte: ${value.toUpperCase()}
+                      </option>
+                    `
+                  )
+                  .join("")}
+              </select>
+            </div>
+            <div class="inline-two">
+              <input name="username" placeholder="Usuario padrao" value="${defaults.username || ""}">
+              <div class="password-field">
+                <input type="password" name="password" placeholder="Senha padrao" value="${defaults.password || ""}">
+                <button type="button" class="secondary-button toggle-password" data-password-target="template-${tpl.id}">Mostrar</button>
+              </div>
+            </div>
+            <div class="inline-three">
+              <input name="port" type="number" placeholder="Porta padrao" value="${defaults.port || 22}">
+              <input name="poll_interval_sec" type="number" placeholder="Poll (s)" value="${defaults.poll_interval_sec || 300}">
+              <input name="command_timeout_sec" type="number" placeholder="Timeout (s)" value="${defaults.command_timeout_sec || 20}">
+            </div>
+            <div class="inline-two">
+              <input name="board_model" placeholder="Modelo da placa" value="${defaults.board_model || "GPON"}">
+              <input name="board_slots" placeholder="Slots da placa" value="${defaults.board_slots || "0/1"}">
+            </div>
+            <div class="inline-three">
+              <input name="ports_per_board" type="number" placeholder="Portas por placa" value="${defaults.ports_per_board || 4}">
+              <input name="capacity_onu" type="number" placeholder="Capacidade ONU" value="${defaults.capacity_onu || 128}">
+              <select name="status">
+                ${["online", "warning", "offline"]
+                  .map(
+                    (value) => `
+                      <option value="${value}" ${(defaults.status || "online") === value ? "selected" : ""}>
+                        Status: ${value}
+                      </option>
+                    `
+                  )
+                  .join("")}
+              </select>
+            </div>
+            <div class="inline-two">
               <input
                 name="snmp_read_community"
                 placeholder="SNMP community leitura"
                 value="${extra.snmp_read_community || extra.snmp_community || ""}"
+              >
+              <input
+                name="snmp_write_community"
+                placeholder="SNMP community escrita"
+                value="${extra.snmp_write_community || ""}"
               >
             </div>
             <div class="inline-two">
@@ -3849,11 +3972,35 @@ function renderConnectionTemplates() {
                   )
                   .join("")}
               </select>
-              <input
-                name="snmp_write_community"
-                placeholder="SNMP community escrita"
-                value="${extra.snmp_write_community || ""}"
-              >
+              <input name="api_base_url" placeholder="API URL padrao" value="${defaults.api_base_url || ""}">
+            </div>
+            <div class="inline-two">
+              <input name="api_token" placeholder="API token padrao" value="${defaults.api_token || ""}">
+              <input name="source_path" placeholder="Arquivo padrao" value="${defaults.source_path || ""}">
+            </div>
+            <div class="inline-two">
+              <input name="command_line" placeholder="Comando padrao" value="${defaults.command_line || ""}">
+              <select name="protocol">
+                ${["native", "api", "json-file", "command", "mock"]
+                  .map(
+                    (value) => `
+                      <option value="${value}" ${(defaults.protocol || "native") === value ? "selected" : ""}>
+                        Protocolo: ${value}
+                      </option>
+                    `
+                  )
+                  .join("")}
+              </select>
+            </div>
+            <div class="inline-two">
+              <label class="checkbox-row">
+                <input type="checkbox" name="enabled" ${defaults.enabled ?? true ? "checked" : ""}>
+                Coleta habilitada
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" name="verify_tls" ${defaults.verify_tls ? "checked" : ""}>
+                Verificar TLS
+              </label>
             </div>
             <div class="inline-two">
               <input
@@ -4576,6 +4723,26 @@ async function saveConnectionTemplate(templateId) {
     brand: value("brand"),
     model: value("model"),
     firmware: value("firmware"),
+    defaults: {
+      protocol: value("protocol") || "native",
+      transport_type: value("transport_type") || "ssh",
+      username: value("username"),
+      password: value("password"),
+      api_base_url: value("api_base_url"),
+      api_token: value("api_token"),
+      source_path: value("source_path"),
+      command_line: value("command_line"),
+      port: Number(value("port") || 22),
+      poll_interval_sec: Number(value("poll_interval_sec") || 300),
+      command_timeout_sec: Number(value("command_timeout_sec") || 20),
+      enabled: Boolean(read("enabled")?.checked),
+      verify_tls: Boolean(read("verify_tls")?.checked),
+      status: value("status") || "online",
+      board_model: value("board_model") || "GPON",
+      board_slots: value("board_slots") || "0/1",
+      ports_per_board: Number(value("ports_per_board") || 4),
+      capacity_onu: Number(value("capacity_onu") || 128),
+    },
     extra_config: {
       collector_profile: value("collector_profile") || "auto",
       command_overrides: commandOverrides,
@@ -5780,6 +5947,9 @@ function bindEvents() {
       } else if (formId.startsWith("connection-")) {
         const oltId = formId.replace("connection-", "");
         passwordInput = document.querySelector(`form[data-connection-olt-id="${oltId}"] input[name='password']`);
+      } else if (formId.startsWith("template-")) {
+        const templateId = formId.replace("template-", "");
+        passwordInput = document.querySelector(`form[data-template-id="${templateId}"] input[name='password']`);
       }
       if (passwordInput) {
         const nextType = passwordInput.type === "password" ? "text" : "password";
