@@ -51,7 +51,10 @@ const state = {
   onuSignalRefreshTimerId: null,
   onuSignalRefreshCountdown: 30,
   onuSignalRefreshPendingOnuId: null,
+  usersFeedback: null,
 };
+
+let usersFeedbackTimerId = null;
 
 const ONU_SIGNAL_AUTO_REFRESH_INTERVAL_SEC = 30;
 const ONU_LIVE_MONITOR_INTERVAL_MS = 5000;
@@ -331,6 +334,11 @@ function clearAppDataForLogout() {
   state.onuDeleteProgress = {};
   state.onuLiveSeriesByOnuId = {};
   state.onuPhysicalStatusByOnuId = {};
+  state.usersFeedback = null;
+  if (usersFeedbackTimerId) {
+    window.clearTimeout(usersFeedbackTimerId);
+    usersFeedbackTimerId = null;
+  }
   stopOnuLiveMonitor();
 }
 
@@ -415,6 +423,28 @@ function setAuthStatus(message = "", isError = false) {
   }
   statusNode.textContent = message || "";
   statusNode.style.color = isError ? "#9f3f35" : "";
+}
+
+function setUsersFeedback(message = "", isError = false, timeoutMs = 5000) {
+  const normalizedMessage = String(message || "").trim();
+  state.usersFeedback = normalizedMessage
+    ? {
+      message: normalizedMessage,
+      isError: Boolean(isError),
+    }
+    : null;
+  if (usersFeedbackTimerId) {
+    window.clearTimeout(usersFeedbackTimerId);
+    usersFeedbackTimerId = null;
+  }
+  renderUsers();
+  if (state.usersFeedback && timeoutMs > 0) {
+    usersFeedbackTimerId = window.setTimeout(() => {
+      state.usersFeedback = null;
+      usersFeedbackTimerId = null;
+      renderUsers();
+    }, timeoutMs);
+  }
 }
 
 function showAuthScreen() {
@@ -3407,8 +3437,106 @@ function renderRequestPreview(preview) {
   `;
 }
 
+function captureConnectionFormState() {
+  const valuesByOltId = {};
+  document.querySelectorAll("form[data-connection-olt-id]").forEach((form) => {
+    const oltId = String(form.dataset.connectionOltId || "").trim();
+    if (!oltId) {
+      return;
+    }
+    const values = {};
+    form.querySelectorAll("input[name], select[name], textarea[name]").forEach((field) => {
+      const name = String(field.name || "").trim();
+      if (!name) {
+        return;
+      }
+      if (field.type === "checkbox") {
+        values[name] = Boolean(field.checked);
+      } else {
+        values[name] = field.value;
+      }
+    });
+    valuesByOltId[oltId] = values;
+  });
+
+  let focus = null;
+  const active = document.activeElement;
+  if (active?.closest && active?.name) {
+    const activeForm = active.closest("form[data-connection-olt-id]");
+    if (activeForm) {
+      focus = {
+        oltId: String(activeForm.dataset.connectionOltId || "").trim(),
+        name: String(active.name || "").trim(),
+      };
+      if ("selectionStart" in active && "selectionEnd" in active) {
+        focus.selectionStart = active.selectionStart;
+        focus.selectionEnd = active.selectionEnd;
+      }
+    }
+  }
+  return { valuesByOltId, focus };
+}
+
+function restoreConnectionFormState(snapshot) {
+  const valuesByOltId = snapshot?.valuesByOltId || {};
+  Object.entries(valuesByOltId).forEach(([oltId, values]) => {
+    const form = document.querySelector(`form[data-connection-olt-id="${Number(oltId)}"]`);
+    if (!form) {
+      return;
+    }
+    const fieldsByName = {};
+    form.querySelectorAll("input[name], select[name], textarea[name]").forEach((field) => {
+      const name = String(field.name || "").trim();
+      if (!name || fieldsByName[name]) {
+        return;
+      }
+      fieldsByName[name] = field;
+    });
+    Object.entries(values || {}).forEach(([name, value]) => {
+      const field = fieldsByName[name];
+      if (!field) {
+        return;
+      }
+      if (field.type === "checkbox") {
+        field.checked = Boolean(value);
+      } else if (typeof value === "string") {
+        field.value = value;
+      }
+    });
+  });
+
+  const focus = snapshot?.focus;
+  if (!focus?.oltId || !focus?.name) {
+    return;
+  }
+  const form = document.querySelector(`form[data-connection-olt-id="${Number(focus.oltId)}"]`);
+  if (!form) {
+    return;
+  }
+  const focusField = Array.from(form.querySelectorAll("input[name], select[name], textarea[name]")).find(
+    (field) => String(field.name || "").trim() === focus.name
+  );
+  if (!focusField || focusField.disabled) {
+    return;
+  }
+  focusField.focus({ preventScroll: true });
+  if (
+    "selectionStart" in focusField &&
+    "selectionEnd" in focusField &&
+    Number.isInteger(focus.selectionStart) &&
+    Number.isInteger(focus.selectionEnd)
+  ) {
+    try {
+      focusField.setSelectionRange(focus.selectionStart, focus.selectionEnd);
+    } catch (_) {
+      // Ignora campos que nao aceitam selecao de cursor.
+    }
+  }
+}
+
 function renderConnections() {
   const canManageCollection = hasPermission("collection_manage");
+  const formSnapshot = captureConnectionFormState();
   if (!state.connections.length) {
     document.getElementById("connectionsList").innerHTML =
       '<div class="muted">Nenhuma conexao cadastrada. Cadastre uma OLT primeiro.</div>';
@@ -3602,6 +3730,7 @@ function renderConnections() {
       `
     )
     .join("");
+  restoreConnectionFormState(formSnapshot);
   if (canManageCollection) {
     unlockSnmpFields();
     return;
@@ -3950,11 +4079,19 @@ function renderUsers() {
 
   if (!canViewUsers) {
     summaryNode.textContent = "Acesso restrito";
+    summaryNode.style.color = "";
     usersListNode.innerHTML = '<div class="muted">Sem permissao para visualizar usuarios.</div>';
     return;
   }
 
-  summaryNode.textContent = `${state.users.length} usuario(s)`;
+  const usersBaseSummary = `${state.users.length} usuario(s)`;
+  if (state.usersFeedback?.message) {
+    summaryNode.textContent = `${usersBaseSummary} - ${state.usersFeedback.message}`;
+    summaryNode.style.color = state.usersFeedback.isError ? "#9f3f35" : "var(--ok)";
+  } else {
+    summaryNode.textContent = usersBaseSummary;
+    summaryNode.style.color = "";
+  }
   if (!state.users.length) {
     usersListNode.innerHTML = '<div class="muted">Nenhum usuario cadastrado.</div>';
     return;
@@ -4043,6 +4180,67 @@ async function createUser() {
   renderUserPermissionInputs(form, state.permissionCatalog, {});
   syncUserFormAdminState(form);
   await loadData();
+  setUsersFeedback("Usuario criado com sucesso.");
+}
+
+function isSamePermissionSet(left, right) {
+  const keys = new Set([...Object.keys(left || {}), ...Object.keys(right || {})]);
+  for (const key of keys) {
+    if (Boolean(left?.[key]) !== Boolean(right?.[key])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function buildUserUpdateSuccessMessage(previousUser, payload) {
+  if (!previousUser) {
+    return payload?.password ? "Senha atualizada com sucesso." : "Cadastro atualizado com sucesso.";
+  }
+  const changedFields = [];
+  if (String(payload?.display_name || "") !== String(previousUser.display_name || "")) {
+    changedFields.push("nome");
+  }
+  if (String(payload?.username || "") !== String(previousUser.username || "")) {
+    changedFields.push("login");
+  }
+  if (String(payload?.password || "") !== "") {
+    changedFields.push("senha");
+  }
+  if (Boolean(payload?.is_active) !== Boolean(previousUser.is_active)) {
+    changedFields.push("status");
+  }
+  if (Boolean(payload?.is_admin) !== Boolean(previousUser.is_admin)) {
+    changedFields.push("perfil");
+  }
+  if (!isSamePermissionSet(payload?.permissions || {}, previousUser.permissions || {})) {
+    changedFields.push("permissoes");
+  }
+  if (changedFields.length === 1) {
+    const field = changedFields[0];
+    if (field === "senha") {
+      return "Senha atualizada com sucesso.";
+    }
+    if (field === "nome") {
+      return "Nome atualizado com sucesso.";
+    }
+    if (field === "login") {
+      return "Login atualizado com sucesso.";
+    }
+    if (field === "status") {
+      return "Status do usuario atualizado com sucesso.";
+    }
+    if (field === "perfil") {
+      return "Perfil do usuario atualizado com sucesso.";
+    }
+    if (field === "permissoes") {
+      return "Permissoes atualizadas com sucesso.";
+    }
+  }
+  if (!changedFields.length) {
+    return "Cadastro atualizado com sucesso.";
+  }
+  return `Cadastro atualizado com sucesso (${changedFields.join(", ")}).`;
 }
 
 async function updateUser(userId) {
@@ -4051,6 +4249,7 @@ async function updateUser(userId) {
   if (!form) {
     return;
   }
+  const previousUser = state.users.find((item) => Number(item.id) === Number(userId)) || null;
   const body = {
     username: form.username.value.trim(),
     display_name: form.display_name.value.trim(),
@@ -4067,6 +4266,7 @@ async function updateUser(userId) {
     state.permissionCatalog = result.permission_catalog;
   }
   await loadData();
+  setUsersFeedback(buildUserUpdateSuccessMessage(previousUser, body));
 }
 
 async function deleteUser(userId) {
@@ -4081,6 +4281,7 @@ async function deleteUser(userId) {
   }
   await fetchJson(`/api/users/${normalized}`, { method: "DELETE" });
   await loadData();
+  setUsersFeedback("Usuario excluido com sucesso.");
 }
 
 function buildRequestFormPayload(requestId) {

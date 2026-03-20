@@ -45,6 +45,7 @@ def ont_summary_commands_for_profile(profile):
     normalized = normalize_profile(profile)
     if normalized == PROFILE_MA5800:
         return [
+            "display ont info 0",
             "display ont info summary all",
             "display ont info summary 0 all",
             "display ont info summary 0/0 all",
@@ -55,6 +56,7 @@ def ont_summary_commands_for_profile(profile):
         ]
     if normalized == PROFILE_MA56XX:
         return [
+            "display ont info 0",
             "display ont info summary 0 all",
             "display ont info summary all",
             "display ont info summary 0 0 all",
@@ -63,6 +65,7 @@ def ont_summary_commands_for_profile(profile):
             "display ont info summary",
         ]
     return [
+        "display ont info 0",
         "display ont info summary 0 all",
         "display ont info summary all",
         "display ont info summary 0/0 all",

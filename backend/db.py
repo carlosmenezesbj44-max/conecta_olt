@@ -1133,7 +1133,7 @@ def update_user(user_id, payload, actor_user_id=None):
     with connect() as connection:
         row = connection.execute(
             """
-            SELECT id, username, display_name, is_active, is_admin, permissions_json,
+            SELECT id, username, display_name, password_hash, is_active, is_admin, permissions_json,
                    last_login_at, created_at, updated_at
             FROM app_user
             WHERE id = ?

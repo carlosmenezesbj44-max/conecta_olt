@@ -2,7 +2,13 @@ import re
 import socket
 import time
 
-from backend.collectors.huawei_profiles import ont_summary_commands_for_profile, resolve_profile
+from backend.collectors.huawei_profiles import (
+    PROFILE_GENERIC,
+    PROFILE_MA56XX,
+    normalize_profile,
+    ont_summary_commands_for_profile,
+    resolve_profile,
+)
 
 PROMPT_PATTERN = re.compile(r"(<[^>\n]+>|\[[^\]\n]+\]|[A-Za-z0-9._()/:-]+[>#])\s*$")
 CONFIRM_PATTERN = re.compile(r"(?i)(are you sure|continue\?|[(\[]\s*(?:y/n|yes/no)\s*[)\]])")
@@ -424,9 +430,16 @@ def _collect_ont_summary_with_fallback_telnet(
     if any(str(item).strip() == "__snmp_bootstrap__" for item in (preferred_commands or [])):
         return "", None
     commands = ont_summary_commands_for_profile(resolved_profile)
+    normalized_profile = normalize_profile(resolved_profile)
+    if normalized_profile in {PROFILE_MA56XX, PROFILE_GENERIC}:
+        # Some MA56xx firmwares require interactive syntax:
+        #   display ont info 0
+        #   all
+        # Sending as a two-line command keeps compatibility in Telnet mode.
+        commands = ["display ont info 0\r\nall", *commands]
     return _run_with_fallback_telnet(
         sock=sock,
-        base_timeout=max(10, min(int(base_timeout or 20), 35)),
+        base_timeout=max(20, int(base_timeout or 20)),
         allow_partial=allow_partial,
         commands=commands,
         payload_check=_looks_like_ont_summary_payload,
@@ -482,6 +495,7 @@ def _run_with_fallback_telnet(
         _send_line(sock, command)
         try:
             raw = _read_until_device_prompt(sock, base_timeout)
+            raw = _complete_command_input_prompts(sock, command, raw, base_timeout)
             output = _clean_output(raw, command)
         except TimeoutError:
             output = ""
@@ -499,6 +513,44 @@ def _run_with_fallback_telnet(
             if used_command is None:
                 used_command = command
     return last_output, used_command
+
+
+def _complete_command_input_prompts(sock, command, raw_output, timeout, max_rounds=4):
+    merged = str(raw_output or "")
+    rounds = 0
+    while rounds < max_rounds and _looks_like_command_input_prompt(merged):
+        response = _resolve_input_prompt_response(merged, command)
+        if response is None:
+            break
+        _send_line(sock, response)
+        merged = merged + "\n" + _read_until_device_prompt(sock, timeout)
+        rounds += 1
+    return merged
+
+
+def _resolve_input_prompt_response(prompt_text, command):
+    tail_lines = [line.strip() for line in str(prompt_text or "").splitlines() if line.strip()]
+    tail = "\n".join(tail_lines[-4:]).lower()
+
+    # Safe defaults for interactive Huawei prompts used by ONT inventory commands.
+    if "<cr>" in tail:
+        return ""
+    if "all<" in tail:
+        return "all"
+    if "frameid" in tail:
+        return "0"
+    if "slotid" in tail:
+        return "0"
+    if "portid" in tail:
+        return "0"
+    if "ontid" in tail:
+        return "0"
+
+    # Do not auto-answer prompts that require specific identifiers.
+    if any(token in tail for token in ("sn-value", "description", "by-desc", "by-ip", "by-mac", "by-loid", "by-password")):
+        return None
+
+    return None
 
 
 def _sync_device_prompt(sock, timeout=2):

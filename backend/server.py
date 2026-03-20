@@ -545,8 +545,12 @@ class AppHandler(BaseHTTPRequestHandler):
 
 def run(host="127.0.0.1", port=8080):
     db.init_db()
+    server = ThreadingHTTPServer((host, port), AppHandler)
     scheduler = PollingScheduler()
     scheduler.start()
-    server = ThreadingHTTPServer((host, port), AppHandler)
-    print(f"ConectaOLT rodando em http://{host}:{port}")
-    server.serve_forever()
+    print(f"ConectaOLT rodando em http://{host}:{port}", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        scheduler.stop()
+        server.server_close()

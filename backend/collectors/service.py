@@ -339,11 +339,17 @@ def _is_full_inventory_due(connection):
     if _parse_bool(extra.get("force_full_inventory"), False):
         return True
     interval_sec = int(extra.get("full_inventory_interval_sec") or 1800)
-    last_poll_at = connection.get("last_poll_at")
-    if not last_poll_at:
+    last_inventory_at = str(extra.get("last_full_inventory_at") or "").strip()
+    if not last_inventory_at:
+        # Fast poll updates last_poll_at on every cycle, so it cannot define
+        # when a new full inventory refresh is due.
+        if _parse_bool(extra.get("fast_poll_enabled"), True):
+            return True
+        last_inventory_at = connection.get("last_poll_at")
+    if not last_inventory_at:
         return True
     try:
-        last = datetime.fromisoformat(str(last_poll_at))
+        last = datetime.fromisoformat(str(last_inventory_at))
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
         elapsed = (datetime.now(timezone.utc) - last).total_seconds()
@@ -436,6 +442,16 @@ def _payload_uses_fast_snapshot(payload):
         if isinstance(details, dict) and details.get("mode") == "fast":
             return True
     return False
+
+
+def _mark_full_inventory_refresh(olt_id, collected_at):
+    db.update_connection_extra_config(
+        olt_id,
+        {
+            "last_full_inventory_at": collected_at or db.utc_now(),
+            "force_full_inventory": False,
+        },
+    )
 
 
 class MockCollector(BaseCollector):
@@ -670,6 +686,7 @@ class NativeCollector(BaseCollector):
                 transport_type=transport_type,
                 allow_empty_inventory=allow_empty_inventory,
             )
+            _mark_full_inventory_refresh(self.olt["id"], payload.get("collected_at"))
             _set_poll_progress(self.olt["id"], 80, "Finalizando payload")
             return payload
         if brand == "huawei" and transport_type == "telnet":
@@ -720,6 +737,7 @@ class NativeCollector(BaseCollector):
                 transport_type=transport_type,
                 allow_empty_inventory=allow_empty_inventory,
             )
+            _mark_full_inventory_refresh(self.olt["id"], payload.get("collected_at"))
             _set_poll_progress(self.olt["id"], 80, "Finalizando payload")
             return payload
         raise CollectorError(
@@ -1003,8 +1021,9 @@ def _enrich_huawei_payload_with_snmp(payload, olt, connection):
     port_count_oid = (extra.get("snmp_port_count_oid") or "").strip()
     ifname_oid = (extra.get("snmp_ifname_oid") or "1.3.6.1.2.1.31.1.1.1.1").strip()
     snmp_fast_mode = _parse_bool(extra.get("snmp_fast_mode"), True)
+    fast_snmp_cycle = snmp_fast_mode and uses_fast_snapshot
     fast_partial_onu_updates = _parse_bool(extra.get("fast_partial_onu_updates"), True)
-    if snmp_fast_mode:
+    if fast_snmp_cycle:
         # OIDs with very large tables that increase latency significantly.
         distance_oid = ""
         status_oid = ""
@@ -1037,20 +1056,28 @@ def _enrich_huawei_payload_with_snmp(payload, olt, connection):
     max_rows = int(extra.get("snmp_max_rows") or 8192)
     retries = int(extra.get("snmp_retries") or 2)
     bulk_repetitions = int(extra.get("snmp_bulk_repetitions") or 25)
-    if snmp_fast_mode:
-        max_rows = min(max_rows, int(extra.get("snmp_fast_max_rows") or 1200))
+    expected_onu_rows = max(0, len(payload.get("onus") or []))
+    fast_backfill_get_limit = None
+    if fast_snmp_cycle:
+        fast_limit = int(extra.get("snmp_fast_max_rows") or 1200)
+        if expected_onu_rows:
+            inventory_margin = min(1024, max(128, int(expected_onu_rows * 0.2)))
+            fast_limit = max(fast_limit, expected_onu_rows + inventory_margin)
+        max_rows = min(max_rows, fast_limit)
         retries = min(retries, int(extra.get("snmp_fast_retries") or 1))
         timeout = min(timeout, int(extra.get("snmp_fast_timeout_sec") or 3))
+        fast_backfill_get_limit = max(0, int(extra.get("snmp_fast_max_get_backfill") or 0))
     signal_scale = float(extra.get("snmp_signal_multiplier") or 1.0)
     signal_offset = float(extra.get("snmp_signal_offset") or 0.0)
     signal_tx_scale = float(extra.get("snmp_signal_tx_multiplier") or signal_scale)
     signal_tx_offset = float(extra.get("snmp_signal_tx_offset") or signal_offset)
-    parallel_walks = int(extra.get("snmp_parallel_walks") or (2 if snmp_fast_mode else 4))
+    parallel_walks = int(extra.get("snmp_parallel_walks") or (2 if fast_snmp_cycle else 4))
     temp_scale = float(extra.get("snmp_temperature_multiplier") or 1.0)
     temp_offset = float(extra.get("snmp_temperature_offset") or 0.0)
 
     try:
         walk_errors = []
+        backfill_get_limits = {}
 
         def _safe_walk(oid_value, oid_label):
             if not oid_value:
@@ -1106,6 +1133,12 @@ def _enrich_huawei_payload_with_snmp(payload, olt, connection):
 
             if not suffix_candidates:
                 return metric_indexed, 0
+            if fast_backfill_get_limit is not None and len(suffix_candidates) > fast_backfill_get_limit:
+                backfill_get_limits[metric_label] = {
+                    "requested": len(suffix_candidates),
+                    "capped": fast_backfill_get_limit,
+                }
+                suffix_candidates = suffix_candidates[:fast_backfill_get_limit]
 
             fetched = {}
             get_errors = []
@@ -1175,7 +1208,7 @@ def _enrich_huawei_payload_with_snmp(payload, olt, connection):
             ("port_count", port_count_oid),
             ("ifname", ifname_oid),
         ]
-        if serial_oid and not cache_hit:
+        if serial_oid and not cache_hit and not fast_snmp_cycle:
             walk_plan.insert(0, ("serial", serial_oid))
         requested = [(label, oid_value) for label, oid_value in walk_plan if oid_value]
         if requested:
@@ -1193,7 +1226,7 @@ def _enrich_huawei_payload_with_snmp(payload, olt, connection):
                         walk_errors.append(f"{label}: {error}")
                         walk_results[label] = []
 
-        if serial_oid and not cache_hit:
+        if serial_oid and not cache_hit and not fast_snmp_cycle:
             serial_rows = walk_results.get("serial", [])
             serial_rows_count = len(serial_rows)
             serial_indexed = snmp_client.build_indexed_map(serial_rows, serial_oid)
@@ -1480,7 +1513,7 @@ def _enrich_huawei_payload_with_snmp(payload, olt, connection):
                 except Exception:
                     pass
 
-        if snmp_fast_mode and fast_partial_onu_updates:
+        if fast_snmp_cycle and fast_partial_onu_updates:
             onu_rows = payload.get("onus", [])
             total_onus = len(onu_rows)
             touched_ratio = (len(touched_serials) / float(total_onus)) if total_onus else 0.0
@@ -1612,6 +1645,7 @@ def _enrich_huawei_payload_with_snmp(payload, olt, connection):
                     "ports_updated": ports_updated,
                     "onus_touched": len(touched_serials),
                     "onus_sent_to_db": len(payload.get("onus", [])),
+                    "get_backfill_limits": backfill_get_limits,
                     "walk_errors": walk_errors,
                 },
             }
