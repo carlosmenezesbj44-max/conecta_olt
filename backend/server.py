@@ -391,8 +391,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "olts"] and parts[3] == "connect-test":
             try:
                 result = connectivity.test_olt_connection(int(parts[2]))
-                status = HTTPStatus.OK if result.get("status") == "connected" else HTTPStatus.BAD_REQUEST
-                self._send_json(result, status=status)
+                self._send_json(result)
             except ValueError as error:
                 self._send_json({"error": str(error)}, status=HTTPStatus.BAD_REQUEST)
             return

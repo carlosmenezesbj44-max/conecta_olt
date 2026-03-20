@@ -142,7 +142,7 @@ async function fetchJson(path, options = {}) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const error = new Error(payload.error || "Falha na requisicao.");
+    const error = new Error(payload.error || payload.message || payload.details || payload.stage || "Falha na requisicao.");
     error.status = response.status;
     error.payload = payload;
     throw error;
@@ -5002,6 +5002,11 @@ async function connectOlt() {
     method: "POST",
     body: "{}",
   });
+  if (result.status !== "connected") {
+    const message = result.message || "Falha ao conectar com a OLT.";
+    setOltConnectStatus("critical", message);
+    throw new Error(message);
+  }
   setOltConnectStatus("ok", `${result.message}. Iniciando coleta...`);
   let pollMessage = "Coleta iniciada.";
   try {
