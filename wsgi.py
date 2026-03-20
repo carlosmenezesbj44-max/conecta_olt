@@ -34,11 +34,17 @@ def application(environ, start_response):
     
     # Cria uma instância do handler simulando um socket de servidor
     class MockSocket:
+        def __init__(self, output):
+            self.output = output
         def makefile(self, mode, *args, **kwargs):
             if 'r' in mode: return stdin
-            return stdout
+            return self.output
+        def sendall(self, b):
+            self.output.write(b)
+        def getsockname(self):
+            return ('127.0.0.1', 80)
 
-    handler = AppHandler(MockSocket(), environ['REMOTE_ADDR'], None)
+    handler = AppHandler(MockSocket(stdout), environ['REMOTE_ADDR'], None)
     
     # Mapeia o ambiente WSGI para os campos do BaseHTTPRequestHandler
     handler.command = environ['REQUEST_METHOD']
