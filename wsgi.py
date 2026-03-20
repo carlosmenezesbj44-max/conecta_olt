@@ -49,6 +49,9 @@ def application(environ, start_response):
     handler.headers = {k.replace('HTTP_', '').replace('_', '-').title(): v for k, v in environ.items() if k.startswith('HTTP_')}
     if 'CONTENT_TYPE' in environ: handler.headers['Content-Type'] = environ['CONTENT_TYPE']
     if 'CONTENT_LENGTH' in environ: handler.headers['Content-Length'] = environ['CONTENT_LENGTH']
+    
+    # Adiciona requestline para evitar erro no log_request do BaseHTTPRequestHandler
+    handler.requestline = f"{handler.command} {handler.path} {handler.request_version}"
 
     # Executa o método correspondente (do_GET, do_POST, etc)
     method_name = f'do_{handler.command}'

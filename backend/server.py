@@ -497,6 +497,9 @@ class AppHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
+    def log_request(self, code='-', size='-'):
+        return
+
     def _read_json(self):
         length = int(self.headers.get("Content-Length", "0"))
         if not length:
